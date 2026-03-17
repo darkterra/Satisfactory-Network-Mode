@@ -274,17 +274,28 @@ function ContainerScanner.scan()
 
     local invOk, inventories = pcall(container.proxy.getInventories, container.proxy)
     if invOk and inventories then
-      -- Find the main storage inventory (largest by slot count).
-      -- Satisfactory containers expose I/O buffer inventories (typically 3 slots)
-      -- alongside the main storage; we only want the primary one.
+      -- Find the main storage inventory.
+      -- Regular containers: large main storage + small I/O buffer (~3 slots).
+      -- Dimensional Depots: single real slot + belt I/O inventories.
+      -- Heuristic: prefer the largest inventory with >3 slots.
+      -- If none found (e.g. Dimensional Depot), use the smallest.
       local mainInv = nil
       local mainSize = 0
+      local smallestInv = nil
+      local smallestSize = math.huge
       for _, inventory in ipairs(inventories) do
         local sz = inventory.size or 0
-        if sz > mainSize then
+        if sz > 3 and sz > mainSize then
           mainSize = sz
           mainInv = inventory
         end
+        if sz > 0 and sz < smallestSize then
+          smallestSize = sz
+          smallestInv = inventory
+        end
+      end
+      if not mainInv then
+        mainInv = smallestInv
       end
 
       if mainInv then
@@ -393,6 +404,7 @@ function ContainerScanner.scan()
     end
   end
 
+  local defGroup = result.groups[config.defaultGroup]
   result.globalStats = {
     totalGroups = #groupOrder,
     totalContainers = globalContainerCount,
@@ -404,6 +416,8 @@ function ContainerScanner.scan()
     avgFill = globalContainerCount > 0
       and math.floor((globalFillSum / globalContainerCount) * 10) / 10
       or 0,
+    defaultGroupName = config.defaultGroup,
+    defaultGroupCount = defGroup and defGroup.containerCount or 0,
   }
 
   return result

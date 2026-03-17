@@ -1,6 +1,7 @@
 -- modules/container_display.lua
 -- Renders container inventory data on a GPU T1 screen.
--- Supports three display modes: overview, detail, and both.
+-- Supports display modes cycled via click: "both" (overview+detail) and "compact".
+-- Click-based pagination and sort cycling on footer buttons.
 -- Falls back to console output if no GPU/screen is available.
 
 local ContainerDisplay = {}
@@ -29,6 +30,9 @@ local COLORS = {
   fillFull   = { 0.2, 0.7, 1.0, 1.0 },
   itemName   = { 0.8, 0.8, 0.6, 1.0 },
   count      = { 0.9, 0.9, 0.9, 1.0 },
+  button     = { 0.15, 0.15, 0.25, 1.0 },
+  buttonText = { 0.8, 0.9, 1.0, 1.0 },
+  buttonDim  = { 0.4, 0.5, 0.6, 1.0 },
 }
 
 -- Display state
@@ -36,12 +40,30 @@ local state = {
   gpu = nil,
   screen = nil,
   enabled = false,
-  displayMode = "both", -- "overview", "detail", "both"
+  displayMode = "both", -- "both", "overview", "detail", or "compact" (cycled via click)
+  compactPrefixStrip = "",
+  defaultGroupName = "default",
 }
 
--- Scroll offset for detail view
-local scrollOffset = 0
-local maxScroll = 0
+-- Available display modes (cycled via click)
+local DISPLAY_MODES = { "both", "overview", "detail", "compact" }
+
+-- Sort modes for detail view
+local SORT_MODES = { "alpha", "fill_asc", "fill_desc" }
+local SORT_LABELS = { alpha = "A-Z", fill_asc = "Fill+", fill_desc = "Fill-" }
+local currentSortIdx = 1
+
+-- Pagination state (for detail section)
+local currentPage = 1
+local totalPages = 1
+local pageSize = 0 -- computed at render time based on available rows
+
+-- Footer click-zone definitions (populated at render time)
+-- Each entry: { x1, x2, action }
+local footerButtons = {}
+
+-- Last scan result reference (for re-sorting without re-scan)
+local lastScanResult = nil
 
 -- ============================================================================
 -- Initialization
@@ -50,9 +72,9 @@ local maxScroll = 0
 --- Initialize the display with a GPU and screen.
 -- @param gpu GPU T1 proxy
 -- @param screen Screen proxy (PCI or network)
--- @param displayMode string - "overview", "detail", or "both"
+-- @param displayMode string - initial display mode ("both" or "compact")
 -- @return boolean success
-function ContainerDisplay.init(gpu, screen, displayMode)
+function ContainerDisplay.init(gpu, screen, options)
   if not gpu or not screen then
     print("[CONT_DSP] No GPU/Screen - using console fallback")
     state.enabled = false
@@ -61,25 +83,28 @@ function ContainerDisplay.init(gpu, screen, displayMode)
 
   state.gpu = gpu
   state.screen = screen
-  state.displayMode = displayMode or "both"
+
+  options = options or {}
+  local dm = options.displayMode or "both"
+  if dm == "overview" or dm == "detail" or dm == "compact" or dm == "both" then
+    state.displayMode = dm
+  else
+    state.displayMode = "both"
+  end
+  state.compactPrefixStrip = options.compactPrefixStrip or ""
+  state.defaultGroupName = options.defaultGroupName or "default"
 
   gpu:bindScreen(screen)
   gpu:setSize(W, H)
   state.enabled = true
 
-  -- Listen for mouse events (scrolling)
+  -- Listen for mouse events (click-based navigation)
   event.listen(gpu)
   if SIGNAL_HANDLERS then
     SIGNAL_HANDLERS["OnMouseDown"] = SIGNAL_HANDLERS["OnMouseDown"] or {}
     table.insert(SIGNAL_HANDLERS["OnMouseDown"], function(signal, sender, x, y, btn)
       if sender == state.gpu then
         handleClick(x, y, btn)
-      end
-    end)
-    SIGNAL_HANDLERS["OnMouseWheel"] = SIGNAL_HANDLERS["OnMouseWheel"] or {}
-    table.insert(SIGNAL_HANDLERS["OnMouseWheel"], function(signal, sender, x, y, delta)
-      if sender == state.gpu then
-        scrollOffset = math.max(0, math.min(maxScroll, scrollOffset - delta * 3))
       end
     end)
   end
@@ -175,182 +200,574 @@ local function drawLabelValue(col, row, label, value, valueColor)
 end
 
 --- Handle mouse click events.
--- Currently supports scrolling via up/down clicks.
+-- Checks footer button zones and triggers actions.
 function handleClick(x, y, btn)
-  -- Future: click-to-expand group, etc.
+  local footerRow = H - 1
+  if y ~= footerRow then return end
+
+  for _, button in ipairs(footerButtons) do
+    if x >= button.x1 and x <= button.x2 then
+      if button.action == "prev_page" then
+        if currentPage > 1 then
+          currentPage = currentPage - 1
+        end
+      elseif button.action == "next_page" then
+        if currentPage < totalPages then
+          currentPage = currentPage + 1
+        end
+      elseif button.action == "cycle_sort" then
+        currentSortIdx = (currentSortIdx % #SORT_MODES) + 1
+        currentPage = 1
+      elseif button.action == "cycle_mode" then
+        local modeIdx = 1
+        for i, m in ipairs(DISPLAY_MODES) do
+          if m == state.displayMode then modeIdx = i; break end
+        end
+        modeIdx = (modeIdx % #DISPLAY_MODES) + 1
+        state.displayMode = DISPLAY_MODES[modeIdx]
+        currentPage = 1
+      end
+      -- Immediate re-render with last data
+      if lastScanResult then
+        ContainerDisplay.render(lastScanResult)
+      end
+      return
+    end
+  end
 end
 
 -- ============================================================================
 -- Rendering
 -- ============================================================================
 
---- Render the overview section.
--- Shows global stats and per-group summaries.
--- @param scanResult table - from ContainerScanner.scan()
--- @param startRow number - first available row
--- @return number - next available row after rendering
+--- Sort containers within groups based on current sort mode.
+-- @param scanResult table
+local function sortedContainers(scanResult)
+  local sortMode = SORT_MODES[currentSortIdx]
+  for _, groupName in ipairs(scanResult.groupOrder) do
+    local group = scanResult.groups[groupName]
+    if group and group.containers then
+      local sorted = {}
+      for i, c in ipairs(group.containers) do sorted[i] = c end
+      if sortMode == "fill_asc" then
+        table.sort(sorted, function(a, b) return a.totalFill < b.totalFill end)
+      elseif sortMode == "fill_desc" then
+        table.sort(sorted, function(a, b) return a.totalFill > b.totalFill end)
+      else -- "alpha"
+        table.sort(sorted, function(a, b) return a.name < b.name end)
+      end
+      group.containers = sorted
+    end
+  end
+end
+
+--- Get a sorted copy of groupOrder based on current sort mode.
+-- @param scanResult table
+-- @return table - sorted array of group names
+local function sortedGroupOrder(scanResult)
+  local order = {}
+  for _, name in ipairs(scanResult.groupOrder) do
+    table.insert(order, name)
+  end
+  local sortMode = SORT_MODES[currentSortIdx]
+  if sortMode == "fill_asc" then
+    table.sort(order, function(a, b)
+      local ga, gb = scanResult.groups[a], scanResult.groups[b]
+      return (ga and ga.avgFill or 0) < (gb and gb.avgFill or 0)
+    end)
+  elseif sortMode == "fill_desc" then
+    table.sort(order, function(a, b)
+      local ga, gb = scanResult.groups[a], scanResult.groups[b]
+      return (ga and ga.avgFill or 0) > (gb and gb.avgFill or 0)
+    end)
+  end
+  return order
+end
+
+--- Flatten all containers into a single ordered list respecting group order.
+-- @param scanResult table
+-- @return table flat, table bounds
+local function flattenContainers(scanResult, gOrder)
+  local flat = {}
+  local bounds = {}
+  for _, groupName in ipairs(gOrder or scanResult.groupOrder) do
+    local group = scanResult.groups[groupName]
+    if group then
+      local startIdx = #flat + 1
+      for _, c in ipairs(group.containers) do
+        table.insert(flat, { container = c, groupName = groupName, group = group })
+      end
+      table.insert(bounds, { groupName = groupName, startIdx = startIdx, endIdx = #flat })
+    end
+  end
+  return flat, bounds
+end
+
+-- ============================================================================
+-- Rendering
+-- ============================================================================
+
+--- Render the overview section (global stats only, always shown).
+-- @param scanResult table
+-- @param startRow number
+-- @return number - next available row
 local function renderOverview(scanResult, startRow)
   local row = startRow
   local stats = scanResult.globalStats
 
   txt(1, row, "OVERVIEW", COLORS.title)
+  local modeTag = "  [" .. state.displayMode .. "]"
+  txt(10, row, modeTag, COLORS.dim)
   row = row + 1
 
-  -- Global stats line
   drawLabelValue(2, row, "Containers: ", tostring(stats.totalContainers), COLORS.text)
   drawLabelValue(24, row, "Items: ", formatCount(stats.totalItems), COLORS.text)
   drawLabelValue(44, row, "Slots: ", stats.slotsUsed .. "/" .. stats.totalSlots, COLORS.text)
   drawLabelValue(66, row, "Avg fill: ", string.format("%.1f%%", stats.avgFill), getFillColor(stats.avgFill))
+  if stats.defaultGroupCount and stats.defaultGroupCount > 0 then
+    drawLabelValue(88, row, "Default: ", tostring(stats.defaultGroupCount), COLORS.warning)
+  end
   row = row + 1
 
   drawSeparator(row)
   row = row + 1
-
-  -- Per-group summaries
-  for _, groupName in ipairs(scanResult.groupOrder) do
-    if row >= H - 2 then break end
-    local group = scanResult.groups[groupName]
-    if group then
-      -- Group header: name + container count + fill bar
-      txt(1, row, "GROUP: ", COLORS.label)
-      txt(8, row, group.name, COLORS.groupName)
-      local countText = " (" .. group.containerCount .. " containers)"
-      txt(8 + #group.name, row, countText, COLORS.dim)
-
-      -- Fill bar at fixed position
-      drawFillBar(50, row, 20, group.avgFill)
-      row = row + 1
-      if row >= H - 2 then break end
-
-      -- Items summary and top items on same line
-      drawLabelValue(3, row, "Items: ", formatCount(group.totalItems), COLORS.text)
-      drawLabelValue(22, row, "Slots: ", group.slotsUsed .. "/" .. group.totalSlots, COLORS.text)
-
-      if #group.topItems > 0 then
-        local topCol = 35
-        txt(topCol, row, "Top: ", COLORS.label)
-        topCol = topCol + 5
-        for i, item in ipairs(group.topItems) do
-          if topCol >= W - 20 then break end
-          local itemText = item.name .. " (" .. formatCount(item.count) .. ")"
-          if i < #group.topItems and topCol + #itemText + 2 < W then
-            itemText = itemText .. ", "
-          end
-          txt(topCol, row, itemText, COLORS.itemName)
-          topCol = topCol + #itemText
-        end
-      end
-      row = row + 1
-
-      -- Thin separator between groups
-      if row < H - 2 then
-        state.gpu:setForeground(table.unpack(COLORS.separator))
-        state.gpu:fill(2, row, W - 4, 1, ".")
-        row = row + 1
-      end
-    end
-  end
 
   return row
 end
 
---- Render the detail section.
--- Shows per-container breakdown within each group.
--- @param scanResult table - from ContainerScanner.scan()
--- @param startRow number - first available row
--- @return number - next available row after rendering
+--- Render the detail section with click-based pagination.
+-- Shows group headers with summaries + per-container lines, paginated.
+-- @param scanResult table
+-- @param startRow number
+-- @return number - next available row
 local function renderDetail(scanResult, startRow)
   local row = startRow
-  local virtualRow = 0 -- tracks total content rows for scrolling
 
+  local sortLabel = SORT_LABELS[SORT_MODES[currentSortIdx]] or "A-Z"
   txt(1, row, "DETAIL", COLORS.title)
-  row = row + 1
-  drawSeparator(row)
+  txt(10, row, "(sort: " .. sortLabel .. ")", COLORS.dim)
   row = row + 1
 
-  -- Column headers
-  local headerFormat = string.format("      %-20s %-11s %7s %8s  %-8s  %s", "Container", "Bar", "Fill%", "Items", "Slots", "Top Item")
+  local headerFormat = string.format("  %-20s %-18s %8s  %-8s  %s", "Container", "Fill", "Items", "Slots", "Top Item")
   txt(0, row, headerFormat, COLORS.dim)
   row = row + 1
 
-  local contentStartRow = row
-  local maxContentRows = H - row - 1 -- leave 1 row for footer
+  -- Available content rows (leave 1 for footer)
+  local contentRows = H - row - 1
+  if contentRows < 1 then return row end
 
-  for _, groupName in ipairs(scanResult.groupOrder) do
-    local group = scanResult.groups[groupName]
-    if group then
-      -- Group header
-      if virtualRow >= scrollOffset and row < contentStartRow + maxContentRows then
-        txt(1, row, group.name, COLORS.groupName)
-        local groupInfo = string.format("  (%d containers, avg %.1f%%)", group.containerCount, group.avgFill)
-        txt(1 + #group.name, row, groupInfo, COLORS.dim)
-        row = row + 1
-      end
-      virtualRow = virtualRow + 1
+  local flat, bounds = flattenContainers(scanResult, sortedGroupOrder(scanResult))
+  local totalItems = #flat
 
-      -- Per-container lines
-      for _, c in ipairs(group.containers) do
-        if virtualRow >= scrollOffset and row < contentStartRow + maxContentRows then
-          -- Container name (truncated)
-          local displayName = c.name:match("([^%s]+)")
-          if #displayName > 18 then
-            displayName = displayName:sub(1, 15) .. "..."
-          end
-          txt(2, row, string.format("%-18s", displayName), COLORS.contName)
+  -- Compute page breaks accounting for group header rows
+  local pages = {}
+  local rowsUsed = 0
+  local pageStart = 1
 
-          -- Fill bar
-          local nextNumberColumn = drawFillBar(21, row, 16, c.totalFill)
-
-          txt(nextNumberColumn + 2, row, string.format("%8s", formatCount(c.totalItems)), COLORS.count)
-          txt(nextNumberColumn + 12, row, c.slotsUsed, COLORS.dim)
-          txt(nextNumberColumn + 14, row, "/", COLORS.dim)
-          txt(nextNumberColumn + 15, row, c.totalSlots, COLORS.dim)
-
-          -- Top item
-          local topItemCol = nextNumberColumn + 22
-          if #c.topItems > 0 then
-            local topItem = c.topItems[1].name
-            if #topItem > 18 then topItem = topItem:sub(1, 18) .. "..." end
-            txt(topItemCol, row, topItem, COLORS.itemName)
-
-            -- Second item if space allows
-            if #c.topItems > 1 and topItemCol + #topItem + 2 < W - 20 then
-              local secondItem = ", " .. c.topItems[2].name
-              if #secondItem > 20 then secondItem = secondItem:sub(1, 20) .. "..." end
-              txt(topItemCol + #topItem, row, secondItem, COLORS.dim)
-
-              -- Third item if space allows
-              if #c.topItems > 2 and topItemCol + #topItem + #secondItem + 2 < W - 20 then
-                local thirdItem = ", " .. c.topItems[3].name
-                if #thirdItem > 20 then thirdItem = thirdItem:sub(1, 20) .. "..." end
-                txt(topItemCol + #topItem + #secondItem, row, thirdItem, COLORS.dim)
-              end
-            end
-          end
-
-          row = row + 1
-        end
-        virtualRow = virtualRow + 1
-      end
-
-      -- Blank line between groups
-      if virtualRow >= scrollOffset and row < contentStartRow + maxContentRows then
-        row = row + 1
-      end
-      virtualRow = virtualRow + 1
+  for i, entry in ipairs(flat) do
+    local needsGroupHeader = false
+    for _, b in ipairs(bounds) do
+      if b.startIdx == i then needsGroupHeader = true; break end
     end
-
-    ::continueGroup::
+    local rowCost = needsGroupHeader and 2 or 1
+    if rowsUsed + rowCost > contentRows and rowsUsed > 0 then
+      table.insert(pages, { startIdx = pageStart, endIdx = i - 1 })
+      pageStart = i
+      rowsUsed = rowCost
+    else
+      rowsUsed = rowsUsed + rowCost
+    end
+  end
+  if pageStart <= totalItems then
+    table.insert(pages, { startIdx = pageStart, endIdx = totalItems })
   end
 
-  -- Update max scroll value
-  maxScroll = math.max(0, virtualRow - maxContentRows)
+  totalPages = math.max(1, #pages)
+  if currentPage > totalPages then currentPage = totalPages end
+  if currentPage < 1 then currentPage = 1 end
+
+  local page = pages[currentPage]
+  if page then
+    local lastGroup = nil
+    for i = page.startIdx, page.endIdx do
+      if row >= H - 1 then break end
+      local entry = flat[i]
+      local c = entry.container
+
+      -- Group header with summary
+      if entry.groupName ~= lastGroup then
+        local g = entry.group
+        txt(1, row, g.name, COLORS.groupName)
+        local groupInfo = string.format("  %dx  avg %.1f%%", g.containerCount, g.avgFill)
+        txt(1 + #g.name, row, groupInfo, COLORS.dim)
+        -- Top item for group
+        if #g.topItems > 0 then
+          local topInfo = "  top: " .. g.topItems[1].name
+          txt(1 + #g.name + #groupInfo, row, topInfo, COLORS.itemName)
+        end
+        row = row + 1
+        if row >= H - 1 then break end
+        lastGroup = entry.groupName
+      end
+
+      -- Container line
+      local displayName = c.name:match("([^%s]+)") or c.name
+      if #displayName > 18 then
+        displayName = displayName:sub(1, 15) .. "..."
+      end
+      txt(2, row, string.format("%-18s", displayName), COLORS.contName)
+
+      local nextCol = drawFillBar(21, row, 16, c.totalFill)
+
+      txt(nextCol + 1, row, string.format("%8s", formatCount(c.totalItems)), COLORS.count)
+      local slotsText = string.format("  %d/%d", c.slotsUsed or 0, c.totalSlots or 0)
+      txt(nextCol + 10, row, slotsText, COLORS.dim)
+
+      local topItemCol = nextCol + 11 + #slotsText
+      if #c.topItems > 0 then
+        local topItem = c.topItems[1].name
+        if #topItem > 20 then topItem = topItem:sub(1, 17) .. "..." end
+        txt(topItemCol, row, topItem, COLORS.itemName)
+
+        if #c.topItems > 1 and topItemCol + #topItem + 2 < W - 15 then
+          local second = ", " .. c.topItems[2].name
+          if #second > 20 then second = second:sub(1, 17) .. "..." end
+          txt(topItemCol + #topItem, row, second, COLORS.dim)
+        end
+      end
+
+      row = row + 1
+    end
+  end
 
   return row
 end
 
+--- Render "both" mode: aggregation zone on top + detail zone below, paginated.
+-- Each page shows N groups in both zones. The number of groups per page is
+-- determined by the total space needed for aggregation rows + detail rows.
+-- @param scanResult table
+-- @param startRow number
+-- @return number - next available row
+local function renderBoth(scanResult, startRow)
+  local row = startRow
+
+  -- Get sorted group order
+  local gOrder = sortedGroupOrder(scanResult)
+
+  -- Available content rows (leave 1 for footer)
+  local availableRows = H - row - 1
+  if availableRows < 3 then return row end
+
+  -- Compute pages: each page has aggregation rows + separator + detail rows
+  -- For each group: 1 agg row + 1 detail header row + containerCount detail rows
+  -- Plus 1 separator between zones per page
+  local pages = {}
+  local pageGroups = {}
+  local usedRows = 1 -- 1 for separator between zones
+
+  for _, groupName in ipairs(gOrder) do
+    local group = scanResult.groups[groupName]
+    if group then
+      local cost = 1 + 1 + group.containerCount -- agg + detail header + containers
+      if usedRows + cost > availableRows and #pageGroups > 0 then
+        table.insert(pages, pageGroups)
+        pageGroups = {}
+        usedRows = 1 -- separator
+      end
+      table.insert(pageGroups, groupName)
+      usedRows = usedRows + cost
+    end
+  end
+  if #pageGroups > 0 then
+    table.insert(pages, pageGroups)
+  end
+
+  totalPages = math.max(1, #pages)
+  if currentPage > totalPages then currentPage = totalPages end
+  if currentPage < 1 then currentPage = 1 end
+
+  local currentGroups = pages[currentPage] or {}
+
+  -- === Aggregation zone ===
+  for _, groupName in ipairs(currentGroups) do
+    if row >= H - 1 then break end
+    local group = scanResult.groups[groupName]
+    if group then
+      local gName = group.name
+      if #gName > 20 then gName = gName:sub(1, 18) .. ".." end
+      txt(1, row, string.format("%-20s", gName), COLORS.groupName)
+
+      local info = string.format(" %3dx  avg ", group.containerCount)
+      txt(22, row, info, COLORS.dim)
+
+      local barCol = 22 + #info
+      local nextCol = drawFillBar(barCol, row, 10, group.avgFill)
+
+      if #group.topItems > 0 then
+        local topName = group.topItems[1].name
+        if #topName > 20 then topName = topName:sub(1, 17) .. "..." end
+        txt(nextCol + 2, row, topName, COLORS.itemName)
+      end
+
+      row = row + 1
+    end
+  end
+
+  -- Separator between aggregation and detail zones
+  if row < H - 1 then
+    drawSeparator(row)
+    row = row + 1
+  end
+
+  -- === Detail zone ===
+  for _, groupName in ipairs(currentGroups) do
+    if row >= H - 1 then break end
+    local group = scanResult.groups[groupName]
+    if group then
+      -- Group header
+      txt(1, row, group.name, COLORS.groupName)
+      local groupInfo = string.format("  %dx  avg %.1f%%", group.containerCount, group.avgFill)
+      txt(1 + #group.name, row, groupInfo, COLORS.dim)
+      row = row + 1
+
+      -- Container lines
+      for _, c in ipairs(group.containers) do
+        if row >= H - 1 then break end
+
+        local displayName = c.name:match("([^%s]+)") or c.name
+        if #displayName > 18 then
+          displayName = displayName:sub(1, 15) .. "..."
+        end
+        txt(2, row, string.format("%-18s", displayName), COLORS.contName)
+
+        local nextCol = drawFillBar(21, row, 16, c.totalFill)
+
+        txt(nextCol + 1, row, string.format("%8s", formatCount(c.totalItems)), COLORS.count)
+        local slotsText = string.format("  %d/%d", c.slotsUsed or 0, c.totalSlots or 0)
+        txt(nextCol + 10, row, slotsText, COLORS.dim)
+
+        local topItemCol = nextCol + 11 + #slotsText
+        if #c.topItems > 0 then
+          local topItem = c.topItems[1].name
+          if #topItem > 20 then topItem = topItem:sub(1, 17) .. "..." end
+          txt(topItemCol, row, topItem, COLORS.itemName)
+        end
+
+        row = row + 1
+      end
+    end
+  end
+
+  return row
+end
+
+--- Render "overview" mode: paginated group summary list.
+-- Shows one row per group with key stats.
+-- @param scanResult table
+-- @param startRow number
+-- @return number - next available row
+local function renderOverviewOnly(scanResult, startRow)
+  local row = startRow
+
+  local sortLabel = SORT_LABELS[SORT_MODES[currentSortIdx]] or "A-Z"
+  txt(1, row, "GROUPS", COLORS.title)
+  txt(10, row, "(sort: " .. sortLabel .. ")", COLORS.dim)
+  row = row + 1
+
+  -- Column header
+  local headerFormat = string.format("  %-20s %5s  %-16s  %8s  %8s  %s",
+    "Group", "Count", "Avg Fill", "Items", "Slots", "Top Item")
+  txt(0, row, headerFormat, COLORS.dim)
+  row = row + 1
+
+  local gOrder = sortedGroupOrder(scanResult)
+
+  -- Available content rows
+  local contentRows = H - row - 1
+  if contentRows < 1 then return row end
+
+  totalPages = math.max(1, math.ceil(#gOrder / contentRows))
+  if currentPage > totalPages then currentPage = totalPages end
+  if currentPage < 1 then currentPage = 1 end
+
+  local startIdx = (currentPage - 1) * contentRows + 1
+  local endIdx = math.min(#gOrder, startIdx + contentRows - 1)
+
+  for i = startIdx, endIdx do
+    if row >= H - 1 then break end
+    local groupName = gOrder[i]
+    local group = scanResult.groups[groupName]
+    if group then
+      local gName = group.name
+      if #gName > 20 then gName = gName:sub(1, 18) .. ".." end
+      txt(1, row, string.format("%-20s", gName), COLORS.groupName)
+      txt(22, row, string.format("%4dx", group.containerCount), COLORS.dim)
+
+      local nextCol = drawFillBar(28, row, 10, group.avgFill)
+
+      txt(nextCol + 2, row, string.format("%8s", formatCount(group.totalItems)), COLORS.count)
+      local slotsText = string.format("  %d/%d", group.slotsUsed, group.totalSlots)
+      txt(nextCol + 11, row, slotsText, COLORS.dim)
+
+      local topCol = nextCol + 12 + #slotsText
+      if #group.topItems > 0 then
+        local topName = group.topItems[1].name
+        if #topName > 20 then topName = topName:sub(1, 17) .. "..." end
+        txt(topCol, row, topName, COLORS.itemName)
+      end
+
+      row = row + 1
+    end
+  end
+
+  return row
+end
+
+--- Render compact mode (dense group cards, 3 per row).
+-- @param scanResult table
+-- @param startRow number
+-- @return number - next available row
+local function renderCompact(scanResult, startRow)
+  local row = startRow
+
+  local sortLabel = SORT_LABELS[SORT_MODES[currentSortIdx]] or "A-Z"
+  txt(1, row, "COMPACT", COLORS.title)
+  txt(11, row, "(sort: " .. sortLabel .. ")", COLORS.dim)
+  row = row + 1
+
+  local cardWidth = math.floor(W / 3)
+  local cardsPerRow = 3
+  local barWidth = 8
+
+  -- Sort groups based on current sort mode
+  local groups = {}
+  for _, groupName in ipairs(scanResult.groupOrder) do
+    local group = scanResult.groups[groupName]
+    if group then table.insert(groups, group) end
+  end
+  local sortMode = SORT_MODES[currentSortIdx]
+  if sortMode == "fill_asc" then
+    table.sort(groups, function(a, b) return a.avgFill < b.avgFill end)
+  elseif sortMode == "fill_desc" then
+    table.sort(groups, function(a, b) return a.avgFill > b.avgFill end)
+  end
+  -- "alpha" keeps the original groupOrder (already alphabetical from scanner)
+
+  local availableRows = H - row - 1 -- leave 1 for footer
+  local cardsPerPage = cardsPerRow * availableRows
+  totalPages = math.max(1, math.ceil(#groups / cardsPerPage))
+  if currentPage > totalPages then currentPage = totalPages end
+  if currentPage < 1 then currentPage = 1 end
+
+  local startIdx = (currentPage - 1) * cardsPerPage + 1
+  local endIdx = math.min(#groups, startIdx + cardsPerPage - 1)
+
+  local col = 0
+  local cardInRow = 0
+  for i = startIdx, endIdx do
+    if row >= H - 1 then break end
+    local group = groups[i]
+
+    local gName = group.name
+    if state.compactPrefixStrip ~= "" and gName:sub(1, #state.compactPrefixStrip) == state.compactPrefixStrip then
+      gName = gName:sub(#state.compactPrefixStrip + 1)
+    end
+    if #gName > 12 then gName = gName:sub(1, 10) .. ".." end
+    txt(col, row, gName, COLORS.groupName)
+
+    local cntText = string.format(" %dx", group.containerCount)
+    txt(col + #gName, row, cntText, COLORS.dim)
+
+    local topText = ""
+    if #group.topItems > 0 then
+      local topName = group.topItems[1].name
+      if #topName > 8 then topName = topName:sub(1, 7) .. "." end
+      topText = " " .. topName
+    end
+    local topCol = col + #gName + #cntText
+    if #topText > 0 and topCol + #topText < col + cardWidth - barWidth - 8 then
+      txt(topCol, row, topText, COLORS.itemName)
+    end
+
+    local barCol = col + cardWidth - barWidth - 8
+    drawFillBar(barCol, row, barWidth, group.avgFill)
+
+    cardInRow = cardInRow + 1
+    if cardInRow >= cardsPerRow then
+      cardInRow = 0
+      col = 0
+      row = row + 1
+    else
+      col = col + cardWidth
+    end
+  end
+
+  if cardInRow > 0 then row = row + 1 end
+
+  return row
+end
+
+--- Draw the footer bar with clickable buttons (single line).
+-- @param scanResult table
+-- @param footerRow number
+local function renderFooter(scanResult, footerRow)
+  footerButtons = {}
+
+  local gpu = state.gpu
+
+  gpu:setBackground(0.08, 0.08, 0.15, 1.0)
+  gpu:fill(0, footerRow, W, 1, " ")
+  gpu:setBackground(table.unpack(COLORS.bg))
+
+  local x = 1
+
+  -- [< Prev]
+  local prevLabel = "[<Prev]"
+  local prevColor = currentPage > 1 and COLORS.buttonText or COLORS.buttonDim
+  txt(x, footerRow, prevLabel, prevColor)
+  table.insert(footerButtons, { x1 = x, x2 = x + #prevLabel - 1, action = "prev_page" })
+  x = x + #prevLabel + 1
+
+  -- Page X/Y
+  local pageText = currentPage .. "/" .. totalPages
+  txt(x, footerRow, pageText, COLORS.text)
+  x = x + #pageText + 1
+
+  -- [Next>]
+  local nextLabel = "[Next>]"
+  local nextColor = currentPage < totalPages and COLORS.buttonText or COLORS.buttonDim
+  txt(x, footerRow, nextLabel, nextColor)
+  table.insert(footerButtons, { x1 = x, x2 = x + #nextLabel - 1, action = "next_page" })
+  x = x + #nextLabel + 3
+
+  -- [Sort: X]
+  local sortBtnLabel = "[Sort:" .. (SORT_LABELS[SORT_MODES[currentSortIdx]] or "A-Z") .. "]"
+  txt(x, footerRow, sortBtnLabel, COLORS.buttonText)
+  table.insert(footerButtons, { x1 = x, x2 = x + #sortBtnLabel - 1, action = "cycle_sort" })
+  x = x + #sortBtnLabel + 3
+
+  -- [Mode: X]
+  local modeLabel = "[Mode:" .. state.displayMode .. "]"
+  txt(x, footerRow, modeLabel, COLORS.buttonText)
+  table.insert(footerButtons, { x1 = x, x2 = x + #modeLabel - 1, action = "cycle_mode" })
+
+  -- Right-aligned: containers/groups + last update time
+  local totalSec = math.floor((scanResult.timestamp or 0) / 1000)
+  local hh = math.floor(totalSec / 3600) % 24
+  local mm = math.floor(totalSec / 60) % 60
+  local ss = totalSec % 60
+  local timeStr = string.format("%02d:%02d:%02d", hh, mm, ss)
+
+  local infoText = tostring(scanResult.globalStats.totalContainers) .. "c/"
+    .. tostring(scanResult.globalStats.totalGroups) .. "g"
+  local rightText = infoText .. "  " .. timeStr
+  txt(W - #rightText - 1, footerRow, infoText, COLORS.dim)
+  txt(W - #timeStr - 1, footerRow, timeStr, COLORS.text)
+end
+
 --- Print a console-friendly summary (fallback when no screen).
--- @param scanResult table - from ContainerScanner.scan()
+-- @param scanResult table
 function ContainerDisplay.printReport(scanResult)
   local stats = scanResult.globalStats
   print("--- CONTAINER INVENTORY REPORT ---")
@@ -377,52 +794,42 @@ function ContainerDisplay.printReport(scanResult)
 end
 
 --- Render the full container dashboard on the GPU screen.
--- @param scanResult table - from ContainerScanner.scan()
+-- @param scanResult table
 function ContainerDisplay.render(scanResult)
   if not state.enabled then return end
   if not scanResult then return end
 
+  sortedContainers(scanResult)
+  lastScanResult = scanResult
+
   local gpu = state.gpu
   local row = 0
 
-  -- Clear screen
   gpu:setBackground(table.unpack(COLORS.bg))
   gpu:fill(0, 0, W, H, " ")
 
-  -- Title bar
   local titleText = "=== CONTAINER INVENTORY MONITOR ==="
   txt(math.floor((W - #titleText) / 2), row, titleText, COLORS.title)
   row = row + 1
   drawSeparator(row)
   row = row + 1
 
-  -- Render based on display mode
-  if state.displayMode == "overview" then
-    renderOverview(scanResult, row)
+  -- Overview (global stats only, 3 rows)
+  row = renderOverview(scanResult, row)
+
+  -- Mode-specific content (has full remaining space for pagination)
+  if state.displayMode == "compact" then
+    renderCompact(scanResult, row)
+  elseif state.displayMode == "overview" then
+    renderOverviewOnly(scanResult, row)
   elseif state.displayMode == "detail" then
     renderDetail(scanResult, row)
   else -- "both"
-    row = renderOverview(scanResult, row)
-    if row < H - 5 then
-      drawSeparator(row)
-      row = row + 1
-      renderDetail(scanResult, row)
-    end
+    renderBoth(scanResult, row)
   end
 
-  -- Footer
-  local footerRow = H - 1
-  local timeText = "Last scan: " .. string.format("%.0f", computer.millis() / 1000) .. "s uptime"
-  txt(1, footerRow, timeText, COLORS.separator)
-  local countText = tostring(scanResult.globalStats.totalContainers) .. " containers in "
-    .. tostring(scanResult.globalStats.totalGroups) .. " groups"
-  txt(W - #countText - 1, footerRow, countText, COLORS.dim)
-
-  -- Scroll indicator
-  if maxScroll > 0 then
-    local scrollText = "Scroll: " .. scrollOffset .. "/" .. maxScroll
-    txt(math.floor(W / 2) - math.floor(#scrollText / 2), footerRow, scrollText, COLORS.dim)
-  end
+  -- Footer (1 line at bottom)
+  renderFooter(scanResult, H - 1)
 
   gpu:flush()
 end

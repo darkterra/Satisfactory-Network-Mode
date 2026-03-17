@@ -38,7 +38,8 @@ CONFIG_MANAGER.register("container", {
   { key = "broadcastResults",   label = "Broadcast via network",              type = "boolean", default = true },
   { key = "broadcastMode",      label = "Broadcast (overview/detail/both)",   type = "string",  default = "both" },
   { key = "outputMode",         label = "Output (auto/screen/console)",       type = "string",  default = "auto" },
-  { key = "displayMode",        label = "Display (overview/detail/both)",     type = "string",  default = "both" },
+  { key = "displayMode",        label = "Display (both/overview/detail/compact)", type = "string", default = "both" },
+  { key = "compactPrefixStrip", label = "Compact prefix to strip from groups",   type = "string", default = "" },
   { key = "screenId",           label = "Screen UUID (if mode=screen)",       type = "string" },
   { key = "nickSeparator",      label = "Nick separator for groups",          type = "string",  default = ":" },
   { key = "defaultGroup",       label = "Default group name",                 type = "string",  default = "default" },
@@ -109,7 +110,11 @@ elseif outputMode == "screen" then
     if targetScreen then
       local spareGpu = REGISTRY.pci.gpuT2[1] or REGISTRY.pci.gpuT1[1]
       if spareGpu then
-        displayReady = display.init(spareGpu, targetScreen, containerConfig.displayMode)
+        displayReady = display.init(spareGpu, targetScreen, {
+          displayMode = containerConfig.displayMode,
+          compactPrefixStrip = containerConfig.compactPrefixStrip or "",
+          defaultGroupName = containerConfig.defaultGroup or "default",
+        })
       else
         print("[CONTAINER] No spare GPU available to drive screen " .. containerConfig.screenId)
       end
@@ -123,7 +128,11 @@ elseif outputMode == "screen" then
 elseif outputMode == "auto" then
   local autoGpu, autoScreen, autoGpuType = REGISTRY.getAvailableDisplay()
   if autoGpu and autoScreen then
-    displayReady = display.init(autoGpu, autoScreen, containerConfig.displayMode)
+    displayReady = display.init(autoGpu, autoScreen, {
+      displayMode = containerConfig.displayMode,
+      compactPrefixStrip = containerConfig.compactPrefixStrip or "",
+      defaultGroupName = containerConfig.defaultGroup or "default",
+    })
     print("[CONTAINER] Auto-selected display (GPU " .. autoGpuType .. ")")
   else
     local hasGpu = REGISTRY.pci.gpuT2[1] or REGISTRY.pci.gpuT1[1]
@@ -252,6 +261,21 @@ function discoverContainers(force)
   if containerConfig.enableIndicators ~= false then
     local poleProxies = REGISTRY.getCategory("indicatorPoles")
     indicators.discover(poleProxies)
+
+    -- Log unattached and default group indicator poles for debugging
+    local containerNickSet = {}
+    for _, c in ipairs(scanner.getContainers()) do
+      containerNickSet[c.nick:match("([^%s]+)")] = c.groupName
+    end
+    for _, pole in ipairs(indicators.getPoles()) do
+      local poleNick = pole.nick:match("([^%s]+)")
+      local matchedGroup = containerNickSet[poleNick]
+      if not matchedGroup then
+        print("[CONTAINER] WARN: Indicator '" .. pole.nick .. "' not matched to any container")
+      elseif matchedGroup == (containerConfig.defaultGroup or "default") then
+        print("[CONTAINER] INFO: Indicator '" .. pole.nick .. "' in default group (unconfigured?)")
+      end
+    end
   end
 
   discovered = true
@@ -310,6 +334,22 @@ TASK_MANAGER.register("container_scan", {
     end)
   end,
 })
+
+-- Register indicator blink task (fast tick for empty container LED blinking)
+if containerConfig.enableIndicators ~= false then
+  TASK_MANAGER.register("indicator_blink", {
+    interval = 1,
+    factory = function()
+      return async(function()
+        while true do
+          TASK_MANAGER.heartbeat("indicator_blink")
+          indicators.blinkTick()
+          sleep(0.5)
+        end
+      end)
+    end,
+  })
+end
 
 local modeStr = displayReady and "screen" or "console"
 if broadcastEnabled then modeStr = modeStr .. "+network" end

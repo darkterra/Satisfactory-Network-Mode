@@ -47,6 +47,9 @@ local pairings = {}
 -- Buzzer state tracking (avoid spamming beep/stop)
 local buzzerStates = {} -- containerNick -> boolean (true = currently buzzing)
 
+-- Empty container poles for blink effect (populated by update, consumed by blinkTick)
+local emptyPoles = {}
+
 -- ============================================================================
 -- Initialization
 -- ============================================================================
@@ -164,6 +167,9 @@ end
 function IndicatorController.update(scanResult)
   if not config.enabled then return end
 
+  -- Reset empty poles list (blinkTick uses this)
+  emptyPoles = {}
+
   -- Build a lookup: containerNick -> container fill data
   local fillByNick = {}
   for _, groupName in ipairs(scanResult.groupOrder) do
@@ -183,14 +189,20 @@ function IndicatorController.update(scanResult)
     local fillPercent = fillByNick[poleNickBase]
     if fillPercent ~= nil then
       local numIndicators = #pole.indicators
-      local color = getIndicatorColor(fillPercent)
 
-      if numIndicators > 0 then
-        -- Compute how many indicators should be lit (proportional gauge)
-        local litCount = 0
-        if fillPercent > 0 then
-          litCount = math.max(1, math.ceil(numIndicators * fillPercent / 100))
+      if fillPercent <= 0 then
+        -- Empty container: all indicators off except bottom (blinked by blinkTick)
+        table.insert(emptyPoles, pole)
+        for i, indicator in ipairs(pole.indicators) do
+          if i > 1 then
+            pcall(indicator.setColor, indicator, table.unpack(INDICATOR_COLORS.off))
+          end
+          -- i == 1 (bottom) is left to blinkTick for blink effect
         end
+      elseif numIndicators > 0 then
+        -- Proportional gauge: color by fill level
+        local color = getIndicatorColor(fillPercent)
+        local litCount = math.max(1, math.ceil(numIndicators * fillPercent / 100))
 
         for i, indicator in ipairs(pole.indicators) do
           local setOk
@@ -249,6 +261,29 @@ end
 -- @return table or nil - pole descriptor
 function IndicatorController.getPairing(nick)
   return pairings[nick]
+end
+
+--- Get all discovered pole descriptors.
+-- @return table - array of pole descriptors
+function IndicatorController.getPoles()
+  return poles
+end
+
+--- Toggle blink state for empty container indicators (bottom indicator).
+-- Call at ~1-2 Hz for a visible blink effect.
+function IndicatorController.blinkTick()
+  if not config.enabled then return end
+  local on = math.floor(computer.millis() / 1000) % 2 == 0
+  for _, pole in ipairs(emptyPoles) do
+    if #pole.indicators > 0 then
+      local bottom = pole.indicators[1]
+      if on then
+        pcall(bottom.setColor, bottom, table.unpack(INDICATOR_COLORS.red))
+      else
+        pcall(bottom.setColor, bottom, table.unpack(INDICATOR_COLORS.off))
+      end
+    end
+  end
 end
 
 --- Stop all buzzers and turn off all indicators (cleanup).
