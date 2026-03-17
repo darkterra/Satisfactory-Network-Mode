@@ -88,36 +88,8 @@ function MasterProvisioner.init(networkCard, basePath, slavesDirName)
   -- Open bootstrap port for slave requests
   card:open(PORT_BOOTSTRAP)
   print("[PROVISIONER] Bootstrap port " .. PORT_BOOTSTRAP .. " open")
-
-  -- Validate and log slaves directory contents at init
-  local slavesFullPath = drivePath .. "/" .. slavesDir
-  if filesystem.exists(slavesFullPath) then
-    local children = filesystem.children(slavesFullPath)
-    if children and #children > 0 then
-      local typeNames = {}
-      for _, name in ipairs(children) do
-        if not filesystem.isFile(slavesFullPath .. "/" .. name) then
-          table.insert(typeNames, name)
-        end
-      end
-      print("[PROVISIONER] Slave types found: " .. (#typeNames > 0 and table.concat(typeNames, ", ") or "(none - only files)"))
-    else
-      print("[PROVISIONER] WARNING: Slaves directory is empty: " .. slavesFullPath)
-    end
-  else
-    print("[PROVISIONER] WARNING: Slaves directory not found: " .. slavesFullPath)
-  end
-
+  print("[PROVISIONER] Slaves directory: " .. drivePath .. "/" .. slavesDir)
   return true
-end
-
---- Recover after a game reload.
--- Re-opens the bootstrap port (engine-side state lost on reload).
-function MasterProvisioner.recover()
-  if card then
-    card:open(PORT_BOOTSTRAP)
-    print("[PROVISIONER] Recover: bootstrap port " .. PORT_BOOTSTRAP .. " re-opened")
-  end
 end
 
 -- ============================================================================

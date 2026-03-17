@@ -216,7 +216,7 @@ local PROTECTED_FILES = { ["config.lua"] = true }
 -- @param dirPath string - absolute path to the directory to wipe
 -- @param relPrefix string - relative prefix for protection matching ("" at root)
 local function wipeDirectory(dirPath, relPrefix)
-  local children = filesystem.childs(dirPath)
+  local children = filesystem.children(dirPath)
   if not children then return end
 
   for _, name in ipairs(children) do
@@ -229,7 +229,7 @@ local function wipeDirectory(dirPath, relPrefix)
       -- Recurse into subdirectory first
       wipeDirectory(absPath, relPath)
       -- Remove the directory if it is now empty
-      local remaining = filesystem.childs(absPath)
+      local remaining = filesystem.children(absPath)
       if not remaining or #remaining == 0 then
         filesystem.remove(absPath)
       end
