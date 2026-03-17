@@ -303,8 +303,9 @@ local function renderDetail(scanResult, startRow)
         local nextNumberColumn = drawFillBar(21, row, 16, c.totalFill)
 
         txt(nextNumberColumn + 2, row, string.format("%8s", formatCount(c.totalItems)), COLORS.count)
-        local slotsText = string.format("  %d/%d", c.slotsUsed, c.totalSlots)
-        txt(nextNumberColumn + 11, row, slotsText, COLORS.dim)
+        txt(nextNumberColumn + 13, row, c.slotsUsed, COLORS.dim)
+        txt(nextNumberColumn + 14, row, "/", COLORS.dim)
+        txt(nextNumberColumn + 15, row, c.totalSlots, COLORS.dim)
 
         -- Top item
         local topItemCol = nextNumberColumn + 22
