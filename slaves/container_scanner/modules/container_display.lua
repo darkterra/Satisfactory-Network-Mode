@@ -278,67 +278,67 @@ local function renderDetail(scanResult, startRow)
 
   for _, groupName in ipairs(scanResult.groupOrder) do
     local group = scanResult.groups[groupName]
-    if not group then goto continueGroup end
-
-    -- Group header
-    if virtualRow >= scrollOffset and row < contentStartRow + maxContentRows then
-      txt(1, row, group.name, COLORS.groupName)
-      local groupInfo = string.format("  (%d containers, avg %.1f%%)", group.containerCount, group.avgFill)
-      txt(1 + #group.name, row, groupInfo, COLORS.dim)
-      row = row + 1
-    end
-    virtualRow = virtualRow + 1
-
-    -- Per-container lines
-    for _, c in ipairs(group.containers) do
+    if group then
+      -- Group header
       if virtualRow >= scrollOffset and row < contentStartRow + maxContentRows then
-        -- Container name (truncated)
-        local displayName = c.name:match("([^%s]+)")
-        if #displayName > 18 then
-          displayName = displayName:sub(1, 15) .. "..."
-        end
-        txt(2, row, string.format("%-18s", displayName), COLORS.contName)
+        txt(1, row, group.name, COLORS.groupName)
+        local groupInfo = string.format("  (%d containers, avg %.1f%%)", group.containerCount, group.avgFill)
+        txt(1 + #group.name, row, groupInfo, COLORS.dim)
+        row = row + 1
+      end
+      virtualRow = virtualRow + 1
 
-        -- Fill bar
-        local nextNumberColumn = drawFillBar(21, row, 16, c.totalFill)
+      -- Per-container lines
+      for _, c in ipairs(group.containers) do
+        if virtualRow >= scrollOffset and row < contentStartRow + maxContentRows then
+          -- Container name (truncated)
+          local displayName = c.name:match("([^%s]+)")
+          if #displayName > 18 then
+            displayName = displayName:sub(1, 15) .. "..."
+          end
+          txt(2, row, string.format("%-18s", displayName), COLORS.contName)
 
-        txt(nextNumberColumn + 2, row, string.format("%8s", formatCount(c.totalItems)), COLORS.count)
-        txt(nextNumberColumn + 13, row, c.slotsUsed, COLORS.dim)
-        txt(nextNumberColumn + 14, row, "/", COLORS.dim)
-        txt(nextNumberColumn + 15, row, c.totalSlots, COLORS.dim)
+          -- Fill bar
+          local nextNumberColumn = drawFillBar(21, row, 16, c.totalFill)
 
-        -- Top item
-        local topItemCol = nextNumberColumn + 22
-        if #c.topItems > 0 then
-          local topItem = c.topItems[1].name
-          if #topItem > 18 then topItem = topItem:sub(1, 18) .. "..." end
-          txt(topItemCol, row, topItem, COLORS.itemName)
+          txt(nextNumberColumn + 2, row, string.format("%8s", formatCount(c.totalItems)), COLORS.count)
+          txt(nextNumberColumn + 12, row, c.slotsUsed, COLORS.dim)
+          txt(nextNumberColumn + 14, row, "/", COLORS.dim)
+          txt(nextNumberColumn + 15, row, c.totalSlots, COLORS.dim)
 
-          -- Second item if space allows
-          if #c.topItems > 1 and topItemCol + #topItem + 2 < W - 20 then
-            local secondItem = ", " .. c.topItems[2].name
-            if #secondItem > 20 then secondItem = secondItem:sub(1, 20) .. "..." end
-            txt(topItemCol + #topItem, row, secondItem, COLORS.dim)
+          -- Top item
+          local topItemCol = nextNumberColumn + 22
+          if #c.topItems > 0 then
+            local topItem = c.topItems[1].name
+            if #topItem > 18 then topItem = topItem:sub(1, 18) .. "..." end
+            txt(topItemCol, row, topItem, COLORS.itemName)
 
-            -- Third item if space allows
-            if #c.topItems > 2 and topItemCol + #topItem + #secondItem + 2 < W - 20 then
-              local thirdItem = ", " .. c.topItems[3].name
-              if #thirdItem > 20 then thirdItem = thirdItem:sub(1, 20) .. "..." end
-              txt(topItemCol + #topItem + #secondItem, row, thirdItem, COLORS.dim)
+            -- Second item if space allows
+            if #c.topItems > 1 and topItemCol + #topItem + 2 < W - 20 then
+              local secondItem = ", " .. c.topItems[2].name
+              if #secondItem > 20 then secondItem = secondItem:sub(1, 20) .. "..." end
+              txt(topItemCol + #topItem, row, secondItem, COLORS.dim)
+
+              -- Third item if space allows
+              if #c.topItems > 2 and topItemCol + #topItem + #secondItem + 2 < W - 20 then
+                local thirdItem = ", " .. c.topItems[3].name
+                if #thirdItem > 20 then thirdItem = thirdItem:sub(1, 20) .. "..." end
+                txt(topItemCol + #topItem + #secondItem, row, thirdItem, COLORS.dim)
+              end
             end
           end
-        end
 
+          row = row + 1
+        end
+        virtualRow = virtualRow + 1
+      end
+
+      -- Blank line between groups
+      if virtualRow >= scrollOffset and row < contentStartRow + maxContentRows then
         row = row + 1
       end
       virtualRow = virtualRow + 1
     end
-
-    -- Blank line between groups
-    if virtualRow >= scrollOffset and row < contentStartRow + maxContentRows then
-      row = row + 1
-    end
-    virtualRow = virtualRow + 1
 
     ::continueGroup::
   end
