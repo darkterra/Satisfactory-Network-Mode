@@ -44,10 +44,10 @@ function MasterUpdater.init(card, basePath)
   -- Try to read cached version from disk
   local versionPath = drivePath .. "/VERSION"
   if filesystem.exists(versionPath) then
-    local f = filesystem.open(versionPath, "r")
-    if f then
-      local content = f:read(256)
-      f:close()
+    local file = filesystem.open(versionPath, "r")
+    if file then
+      local content = file:read(256)
+      file:close()
       if content then
         cachedVersion = content:match("^%s*(.-)%s*$") -- trim whitespace
         print("[UPDATER] Current version: " .. cachedVersion)
@@ -425,10 +425,10 @@ function MasterUpdater.run(repoUrl, branch, subPath)
   -- Step 4: Read VERSION file if it was downloaded
   local versionPath = drivePath .. "/VERSION"
   if filesystem.exists(versionPath) then
-    local vf = filesystem.open(versionPath, "r")
-    if vf then
-      local content = vf:read(256)
-      vf:close()
+    local file = filesystem.open(versionPath, "r")
+    if file then
+      local content = file:read(256)
+      file:close()
       if content then
         cachedVersion = content:match("^%s*(.-)%s*$")
         print("[UPDATER] Updated version: " .. cachedVersion)

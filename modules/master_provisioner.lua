@@ -38,10 +38,10 @@ local transferState = nil
 -- @param path string - absolute path
 -- @return string or nil
 local function readFile(path)
-  local f = filesystem.open(path, "r")
-  if not f then return nil end
-  local content = f:read(9999999)
-  f:close()
+  local file = filesystem.open(path, "r")
+  if not file then return nil end
+  local content = file:read(9999999)
+  file:close()
   return content or ""
 end
 
@@ -175,7 +175,7 @@ function MasterProvisioner.collectFilesForSlave(slaveType, identity)
     "lib/config_ui.lua",
     "lib/component_registry.lua",
     "lib/task_manager.lua",
-    "features/network.lua",
+    "features/a_network.lua",
     "modules/network_bus.lua",
   }
 
