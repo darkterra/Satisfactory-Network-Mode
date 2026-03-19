@@ -7,6 +7,7 @@ local networkBus = filesystem.doFile(DRIVE_PATH .. "/modules/network_bus.lua")
 -- Register config schema
 CONFIG_MANAGER.register("network", {
   { key = "basePort",  label = "Base port",       type = "number", default = 100, min = 4, max = 999 },
+  { key = "portRange", label = "Port range",      type = "number", default = 899, min = 50, max = 9000 },
   { key = "identity",  label = "Computer name",   type = "string", default = "PC-1" },
 })
 
@@ -22,10 +23,12 @@ end
 
 -- Initialize the bus
 local basePort = netConfig.basePort or 100
+local portRange = netConfig.portRange or 899
 local identity = netConfig.identity or "Generic-PC-Slave"
 
 local success = networkBus.init(networkCard, {
   basePort = basePort,
+  portRange = portRange,
   identity = identity,
 })
 
@@ -40,7 +43,7 @@ NETWORK_BUS = networkBus
 -- Print the local card UUID (needed by other computers to target this one)
 local cardId = networkBus.getCardId()
 print("[NETWORK] Card UUID: " .. (cardId or "unknown"))
-print("[NETWORK] Identity: " .. identity .. " | Base port: " .. basePort)
+print("[NETWORK] Identity: " .. identity .. " | Base port: " .. basePort .. " | Port range: " .. portRange)
 
 -- Register a heartbeat/discovery channel by default
 -- Other computers can ping this channel to discover peers

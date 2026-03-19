@@ -18,16 +18,45 @@ local NetworkBus = {}
 -- Internal state
 local card = nil
 local config = {
-  basePort = 100,   -- Starting port number (channels offset from this)
+  basePort = 100,   -- Starting port number (discovery channel lives here)
   identity = "unknown", -- Human-readable name for this computer
+  portRange = 899,  -- Range of ports for channels (basePort+1 .. basePort+portRange)
 }
 
 -- Channel registry: channelName -> { port, handlers[] }
 local channels = {}
-local nextPort = 0
 
 -- Port -> channel name reverse lookup
 local portToChannel = {}
+
+-- ============================================================================
+-- Deterministic port hashing
+-- ============================================================================
+
+--- DJB2 string hash for deterministic channel -> port mapping.
+-- Same channel name always produces the same port on every computer.
+-- @param str string - channel name
+-- @return number - hash value (positive integer)
+local function djb2Hash(str)
+  local hash = 5381
+  for i = 1, #str do
+    hash = ((hash * 33) + string.byte(str, i)) % 0x7FFFFFFF
+  end
+  return hash
+end
+
+--- Compute the deterministic port for a channel name.
+-- "discovery" always maps to basePort. All others map to basePort+1 .. basePort+portRange.
+-- @param channelName string
+-- @return number
+local function channelToPort(channelName)
+  if channelName == "discovery" then
+    return config.basePort
+  elseif channelName == "slave_heartbeat" then
+    return config.basePort + 1
+  end
+  return config.basePort + 1 + (djb2Hash(channelName) % config.portRange)
+end
 
 -- ============================================================================
 -- Serialization helpers (tables <-> string, since NetworkCard only sends primitives)
@@ -202,6 +231,7 @@ function NetworkBus.init(networkCard, options)
   if options then
     config.basePort = options.basePort or config.basePort
     config.identity = options.identity or config.identity
+    config.portRange = options.portRange or config.portRange
   end
 
   -- Listen for incoming messages from this card
@@ -225,6 +255,7 @@ function NetworkBus.getIdentity()
 end
 
 --- Register a named channel and open its port for receiving.
+-- Port is computed deterministically from the channel name (same on every computer).
 -- @param channelName string - unique channel name
 -- @return number port - the assigned port number
 function NetworkBus.registerChannel(channelName)
@@ -232,8 +263,21 @@ function NetworkBus.registerChannel(channelName)
     return channels[channelName].port
   end
 
-  local port = config.basePort + nextPort
-  nextPort = nextPort + 1
+  local port = channelToPort(channelName)
+
+  -- Handle hash collision: if another channel already occupies this port,
+  -- offset until we find a free one (extremely rare)
+  local existingChannel = portToChannel[port]
+  if existingChannel and existingChannel ~= channelName then
+    local original = port
+    repeat
+      port = port + 1
+      if port > config.basePort + config.portRange then
+        port = config.basePort + 1
+      end
+    until not portToChannel[port] or portToChannel[port] == channelName or port == original
+    print("[NET_BUS] Hash collision for '" .. channelName .. "': " .. original .. " -> " .. port)
+  end
 
   channels[channelName] = {
     port = port,
