@@ -1,4 +1,4 @@
--- modules/network_bus.lua
+-- lib/network_bus.lua
 -- Generic message bus over FicsIt-Networks NetworkCard.
 -- Provides channel-based pub/sub, targeted send, broadcast, and
 -- simple table serialization (since NetworkCard only carries primitives).
@@ -7,7 +7,7 @@
 -- Each channel can have multiple handlers subscribed.
 --
 -- Usage:
---   local bus = filesystem.doFile(DRIVE_PATH .. "/modules/network_bus.lua")
+--   local bus = filesystem.doFile(DRIVE_PATH .. "/lib/network_bus.lua")
 --   bus.init(networkCard, { basePort = 100, identity = "TrainPC" })
 --   bus.subscribe("train_data", function(sender, payload) ... end)
 --   bus.publish("train_data", { speed = 42, name = "Express" })

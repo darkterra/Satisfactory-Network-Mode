@@ -2,7 +2,7 @@
 -- Inter-computer communication feature via NetworkCard.
 -- Provides a global NETWORK_BUS that other features can use to send/receive messages.
 
-local networkBus = filesystem.doFile(DRIVE_PATH .. "/modules/network_bus.lua")
+local networkBus = filesystem.doFile(DRIVE_PATH .. "/lib/network_bus.lua")
 
 -- Register config schema
 CONFIG_MANAGER.register("network", {

@@ -28,104 +28,6 @@ SIGNAL_HANDLERS = SIGNAL_HANDLERS or {}
 -- Unlike async tasks, these run inline and never yield the computer.
 TICK_HANDLERS = TICK_HANDLERS or {}
 
--- Register EEPROM reboot handler for Slave computers.
--- The SlaveEEPROM keeps a dedicated reboot port always open so the Master
--- can remotely restart any Slave at any time (even during normal operation).
-if EEPROM_RESERVED_PORTS and EEPROM_RESERVED_PORTS.reboot and NETWORK_CARD then
-  local rebootPort = EEPROM_RESERVED_PORTS.reboot
-  SIGNAL_HANDLERS["NetworkMessage"] = SIGNAL_HANDLERS["NetworkMessage"] or {}
-  table.insert(SIGNAL_HANDLERS["NetworkMessage"], function(signal, comp, sender, port, ...)
-    if port == rebootPort then
-      local args = { ... }
-      if args[1] == "reboot" then
-        print("[MAIN] Remote reboot command received - resetting")
-        computer.reset()
-      elseif args[1] == "reboot_for_update" then
-        print("[MAIN] Update reboot - removing main.lua for reprovisioning")
-        if filesystem.exists(DRIVE_PATH .. "/main.lua") then
-          filesystem.remove(DRIVE_PATH .. "/main.lua")
-        end
-        computer.reset()
-      elseif args[1] == "reset" then
-        -- Full factory reset: delete all user files so EEPROM enters degraded mode
-        print("[MAIN] RESET command received - wiping all files")
-        local function removeRecursive(path)
-          if not filesystem.exists(path) then return end
-          if filesystem.isFile(path) then
-            filesystem.remove(path)
-            return
-          end
-          local children = filesystem.children(path)
-          if children then
-            for _, child in ipairs(children) do
-              removeRecursive(path .. "/" .. child)
-            end
-          end
-          filesystem.remove(path)
-        end
-        local entries = filesystem.children(DRIVE_PATH)
-        if entries then
-          for _, entry in ipairs(entries) do
-            removeRecursive(DRIVE_PATH .. "/" .. entry)
-          end
-        end
-        print("[MAIN] All files removed - rebooting to degraded mode")
-        computer.reset()
-      elseif args[1] == "reset_reprovision" then
-        -- Reset and re-specialize: wipe all files, write config.lua
-        -- with the new type (sent by Master) and current identity, then reboot.
-        -- SlaveEEPROM will auto-skip to S_REQUEST (file request) state.
-        local newType = args[2] or "unknown"
-        print("[MAIN] RESET_REPROVISION -> new type: " .. newType)
-        -- Read current identity before wiping
-        local currentIdentity = "unknown"
-        if CONFIG_MANAGER then
-          local slaveCfg = CONFIG_MANAGER.getSection("slave")
-          if slaveCfg and slaveCfg.identity then
-            currentIdentity = slaveCfg.identity
-          elseif CONFIG_MANAGER.get("network", "identity") then
-            currentIdentity = CONFIG_MANAGER.get("network", "identity")
-          end
-        end
-        local function removeRecursive(path)
-          if not filesystem.exists(path) then return end
-          if filesystem.isFile(path) then
-            filesystem.remove(path)
-            return
-          end
-          local children = filesystem.children(path)
-          if children then
-            for _, child in ipairs(children) do
-              removeRecursive(path .. "/" .. child)
-            end
-          end
-          filesystem.remove(path)
-        end
-        local entries = filesystem.children(DRIVE_PATH)
-        if entries then
-          for _, entry in ipairs(entries) do
-            removeRecursive(DRIVE_PATH .. "/" .. entry)
-          end
-        end
-        -- Write minimal config so SlaveEEPROM skips UI and requests files immediately
-        local f = filesystem.open(DRIVE_PATH .. "/config.lua", "w")
-        if f then
-          f:write("return {\n")
-          f:write("  slave = {\n")
-          f:write('    type = "' .. newType .. '",\n')
-          f:write('    identity = "' .. currentIdentity .. '",\n')
-          f:write("  },\n")
-          f:write("}\n")
-          f:close()
-        end
-        print("[MAIN] Files wiped, config written (type=" .. newType .. ", identity=" .. currentIdentity .. ") - rebooting")
-        computer.reset()
-      end
-    end
-  end)
-  print("[MAIN] EEPROM reboot handler registered on port " .. rebootPort)
-end
-
 -- Discover feature files and register enable/disable config for each
 local featureFiles = filesystem.children(DRIVE_PATH .. "/features/")
 if not featureFiles or #featureFiles == 0 then
@@ -168,11 +70,94 @@ end
 REGISTRY.discoverNetwork()
 
 -- Start config UI on the internal screen (if GPU and Screen are available)
-if GPU then
-  local configUI = filesystem.doFile(DRIVE_PATH .. "/lib/config_ui.lua")
-  if configUI and configUI.initialize then
-    configUI.initialize()
+if not GPU then
+  computer.panic("[MAIN] No GPU available - cannot start config UI")
+end
+
+local configUI = filesystem.doFile(DRIVE_PATH .. "/lib/config_ui.lua")
+if not configUI or not configUI.initialize then
+  computer.panic("[MAIN] No config UI module found - expected /lib/config_ui.lua with initialize() function")
+end
+
+configUI.initialize()
+
+        
+local function removeRecursive(path)
+  if not filesystem.exists(path) then return end
+  if filesystem.isFile(path) then
+    filesystem.remove(path)
+    return
   end
+  local children = filesystem.children(path)
+  if children then
+    for _, child in ipairs(children) do
+      removeRecursive(path .. "/" .. child)
+    end
+  end
+  filesystem.remove(path)
+end
+
+-- Register EEPROM reboot handler for Slave computers.
+-- The SlaveEEPROM keeps a dedicated reboot port always open so the Master
+-- can remotely restart any Slave at any time (even during normal operation).
+if EEPROM_RESERVED_PORTS and EEPROM_RESERVED_PORTS.reboot and NETWORK_CARD then
+  local rebootPort = EEPROM_RESERVED_PORTS.reboot
+  SIGNAL_HANDLERS["NetworkMessage"] = SIGNAL_HANDLERS["NetworkMessage"] or {}
+  table.insert(SIGNAL_HANDLERS["NetworkMessage"], function(signal, comp, sender, port, ...)
+    if port == rebootPort then
+      local args = { ... }
+      if args[1] == "reboot" then
+        print("[MAIN] Remote reboot command received - resetting")
+        computer.reset()
+      elseif args[1] == "reboot_for_update" then
+        print("[MAIN] Update reboot - removing main.lua for reprovisioning")
+        if filesystem.exists(DRIVE_PATH .. "/main.lua") then
+          filesystem.remove(DRIVE_PATH .. "/main.lua")
+        end
+        computer.reset()
+      elseif args[1] == "reset_reprovision" then
+        -- Reset and re-specialize: wipe all files, write config.lua
+        -- with the new type (sent by Master) and current identity, then reboot.
+        -- SlaveEEPROM will auto-skip to S_REQUEST (file request) state.
+        local newType = args[2] or "unknown"
+        print("[MAIN] RESET_REPROVISION -> new type: " .. newType)
+        -- Read current identity before wiping
+        local currentIdentity = "unknown"
+        if CONFIG_MANAGER then
+          local slaveCfg = CONFIG_MANAGER.getSection("slave")
+          if slaveCfg and slaveCfg.identity then
+            currentIdentity = slaveCfg.identity
+          elseif CONFIG_MANAGER.get("network", "identity") then
+            currentIdentity = CONFIG_MANAGER.get("network", "identity")
+          end
+        end
+
+        local entries = filesystem.children(DRIVE_PATH)
+        if entries then
+          for _, entry in ipairs(entries) do
+            removeRecursive(DRIVE_PATH .. "/" .. entry)
+          end
+        end
+
+        -- Write minimal config so SlaveEEPROM skips UI and requests files immediately
+        local f = filesystem.open(DRIVE_PATH .. "/config.lua", "w")
+        if f then
+          f:write("return {\n")
+          f:write("  slave = {\n")
+          f:write('    type = "' .. newType .. '",\n')
+          f:write('    identity = "' .. currentIdentity .. '",\n')
+          f:write("  },\n")
+          f:write("}\n")
+          f:close()
+          
+          CONFIG_MANAGER.save()
+        end
+        print("[MAIN] Files wiped, config written (type=" .. newType .. ", identity=" .. currentIdentity .. ") - rebooting")
+        computer.reset()
+      end
+    end
+  end)
+  print("[MAIN] EEPROM reboot handler registered on port " .. rebootPort)
 end
 
 -- Start the event loop
@@ -186,10 +171,8 @@ while true do
   local signalData = { event.pull(0) }
   while signalData[1] do
     -- DEBUG: log all incoming signals (remove once networking is confirmed)
-    if signalData[1] == "NetworkMessage" then
-      -- print("[DEBUG] NetworkMessage received: port=" .. tostring(signalData[4]) .. " from=" .. tostring(signalData[3]))
-    end
     local handlers = SIGNAL_HANDLERS[signalData[1]]
+
     if handlers then
       for _, handler in ipairs(handlers) do
         local ok, err = pcall(handler, table.unpack(signalData))
@@ -198,6 +181,7 @@ while true do
         end
       end
     end
+
     signalData = { event.pull(0) }
   end
 

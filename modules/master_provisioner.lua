@@ -159,7 +159,7 @@ end
 -- ============================================================================
 
 --- Build the complete file list to send to a slave of a given type.
--- Includes common files (main.lua, lib/, features/network.lua, modules/network_bus.lua)
+-- Includes common files (main.lua, lib/, features/network.lua, lib/network_bus.lua)
 -- plus type-specific files from slaves/<type>/.
 -- A config.lua is generated with the slave's type and identity.
 -- @param slaveType string
@@ -175,8 +175,8 @@ function MasterProvisioner.collectFilesForSlave(slaveType, identity)
     "lib/config_ui.lua",
     "lib/component_registry.lua",
     "lib/task_manager.lua",
+    "lib/network_bus.lua",
     "features/a_network.lua",
-    "modules/network_bus.lua",
   }
 
   for _, relPath in ipairs(commonFiles) do
@@ -351,19 +351,6 @@ function MasterProvisioner.sendUpdateReboot(targetCardId)
     fleet[targetCardId].lastSeen = computer.millis()
   end
   print("[PROVISIONER] Update reboot -> " .. targetCardId)
-end
-
---- Send a full reset command (slave wipes all files, enters degraded mode).
--- The slave is removed from the fleet registry since it will be re-specialized.
--- @param targetCardId string
-function MasterProvisioner.sendReset(targetCardId)
-  card:send(targetCardId, PORT_REBOOT, "reset")
-  if fleet[targetCardId] then
-    print("[PROVISIONER] Reset -> " .. (fleet[targetCardId].identity or targetCardId) .. " (" .. (fleet[targetCardId].type or "?") .. ")")
-    fleet[targetCardId] = nil
-  else
-    print("[PROVISIONER] Reset -> " .. targetCardId)
-  end
 end
 
 --- Send a reset-and-reprovision command.
