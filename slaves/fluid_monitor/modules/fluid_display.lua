@@ -219,20 +219,6 @@ local function formatFlow(val)
   return string.format("%.2f", perMin)
 end
 
---- Format flow with unit suffix.
-local function formatFlowUnit(val)
-  return formatFlow(val) .. " m3/min"
-end
-
---- Format fluid volume to compact string (m3).
-local function formatVolume(val)
-  if not val then return "0" end
-  if val >= 10000 then
-    return string.format("%.1fK", val / 1000)
-  end
-  return string.format("%.0f", val)
-end
-
 --- Draw a fill bar.
 local function drawFillBar(col, row, barWidth, percent)
   if row < 0 or row >= H then return barWidth + 2 end
@@ -621,16 +607,125 @@ local function drawNode(col, row, elem)
   gpu:setBackground(table.unpack(COLORS.bg))
 end
 
---- Draw a horizontal pipe connection between two nodes.
-local function drawPipe(col, row, length)
-  if row < 0 or row >= H or length <= 0 then return end
+--- Draw a routed pipe connection between two nodes with arrowhead at target.
+-- Supports same-row (horizontal), same-column (vertical), and L-shaped (90° turn) routing.
+-- The arrowhead lands at the center of the target node face nearest to the source.
+-- @param fromGX number - source grid column
+-- @param fromGY number - source grid row
+-- @param toGX number - target grid column
+-- @param toGY number - target grid row
+-- @param baseRow number - pixel row offset for the grid
+local function drawConnection(fromGX, fromGY, toGX, toGY, baseRow)
   local gpu = state.gpu
-  -- Draw pipe on the middle row of node height
-  local pipeRow = row + math.floor(NODE_H / 2)
-  if pipeRow >= H - 1 then return end
+  if fromGX == toGX and fromGY == toGY then return end
+
+  local fromNCol = fromGX * (NODE_W + NODE_GAP_X)
+  local fromNRow = baseRow + fromGY * (NODE_H + NODE_GAP_Y)
+  local toNCol = toGX * (NODE_W + NODE_GAP_X)
+  local toNRow = baseRow + toGY * (NODE_H + NODE_GAP_Y)
+
+  local fromMidRow = fromNRow + math.floor(NODE_H / 2)
+  local toMidCol = toNCol + math.floor(NODE_W / 2)
+
   gpu:setForeground(table.unpack(COLORS.pipeLine))
-  local pipeStr = string.rep("-", length - 1) .. ">"
-  gpu:setText(col, pipeRow, pipeStr)
+
+  local dx = toGX - fromGX
+  local dy = toGY - fromGY
+
+  if dy == 0 then
+    -- Same row: horizontal pipe, arrowhead on target face
+    local pipeRow = fromMidRow
+    if pipeRow < 0 or pipeRow >= H then return end
+    if dx > 0 then
+      local startC = fromNCol + NODE_W
+      local arrowC = toNCol
+      local gap = arrowC - startC
+      if gap > 0 then
+        gpu:setText(startC, pipeRow, string.rep("-", gap) .. ">")
+      elseif gap == 0 then
+        gpu:setText(arrowC, pipeRow, ">")
+      end
+    elseif dx < 0 then
+      local arrowC = toNCol + NODE_W - 1
+      local endC = fromNCol - 1
+      local gap = endC - arrowC
+      if gap > 0 then
+        gpu:setText(arrowC, pipeRow, "<" .. string.rep("-", gap))
+      elseif gap == 0 then
+        gpu:setText(arrowC, pipeRow, "<")
+      end
+    end
+
+  elseif dx == 0 then
+    -- Same column: vertical pipe, arrowhead on target face
+    local pipeCol = toMidCol
+    if pipeCol < 0 or pipeCol >= W then return end
+    if dy > 0 then
+      local startR = fromNRow + NODE_H
+      local arrowR = toNRow
+      for r = startR, arrowR - 1 do
+        if r >= 0 and r < H then gpu:setText(pipeCol, r, "|") end
+      end
+      if arrowR >= 0 and arrowR < H then
+        gpu:setText(pipeCol, arrowR, "v")
+      end
+    else
+      local arrowR = toNRow + NODE_H - 1
+      local endR = fromNRow - 1
+      if arrowR >= 0 and arrowR < H then
+        gpu:setText(pipeCol, arrowR, "^")
+      end
+      for r = arrowR + 1, endR do
+        if r >= 0 and r < H then gpu:setText(pipeCol, r, "|") end
+      end
+    end
+
+  else
+    -- L-shaped: horizontal from source face, turn 90°, vertical to target face
+    local hRow = fromMidRow
+    local turnCol = toMidCol
+
+    -- Horizontal segment
+    local hStart, hEnd
+    if dx > 0 then
+      hStart = fromNCol + NODE_W
+      hEnd = turnCol
+    else
+      hStart = turnCol
+      hEnd = fromNCol - 1
+    end
+    for c = hStart, hEnd do
+      if c >= 0 and c < W and hRow >= 0 and hRow < H then
+        gpu:setText(c, hRow, "-")
+      end
+    end
+
+    -- Corner at turn point
+    if turnCol >= 0 and turnCol < W and hRow >= 0 and hRow < H then
+      gpu:setText(turnCol, hRow, "+")
+    end
+
+    -- Vertical segment with arrowhead on target face
+    if dy > 0 then
+      local vTop = hRow + 1
+      local arrowR = toNRow
+      for r = vTop, arrowR - 1 do
+        if r >= 0 and r < H then gpu:setText(turnCol, r, "|") end
+      end
+      if arrowR >= 0 and arrowR < H then
+        gpu:setText(turnCol, arrowR, "v")
+      end
+    else
+      local arrowR = toNRow + NODE_H - 1
+      local vBot = hRow - 1
+      if arrowR >= 0 and arrowR < H then
+        gpu:setText(turnCol, arrowR, "^")
+      end
+      for r = arrowR + 1, vBot do
+        if r >= 0 and r < H then gpu:setText(turnCol, r, "|") end
+      end
+    end
+  end
 end
 
 --- Render topology mode: elements placed on a 2D grid by network.
@@ -728,7 +823,7 @@ local function renderTopology(scanResult, startRow)
       end
     end
 
-    -- Draw connection lines between connected nodes in edit mode
+    -- Draw connection arrows between connected nodes in edit mode
     local connections = {}
     if topoLayout and topoLayout.grid and topoLayout.grid[netKey] then
       connections = topoLayout.grid[netKey].connections or {}
@@ -737,31 +832,7 @@ local function renderTopology(scanResult, startRow)
       local fromNode = netLayoutNodes[conn.from]
       local toNode = netLayoutNodes[conn.to]
       if fromNode and toNode then
-        local fromCol = fromNode.gridX * (NODE_W + NODE_GAP_X) + math.floor(NODE_W / 2)
-        local fromRow = gridStartRow + fromNode.gridY * (NODE_H + NODE_GAP_Y) + math.floor(NODE_H / 2)
-        local toCol = toNode.gridX * (NODE_W + NODE_GAP_X) + math.floor(NODE_W / 2)
-        local toRow = gridStartRow + toNode.gridY * (NODE_H + NODE_GAP_Y) + math.floor(NODE_H / 2)
-        -- Same row: draw horizontal pipe
-        if fromNode.gridY == toNode.gridY then
-          local minC = math.min(fromCol, toCol) + 1
-          local maxC = math.max(fromCol, toCol) - 1
-          if maxC >= minC then
-            state.gpu:setForeground(table.unpack(COLORS.pipeLine))
-            local startX = math.min(fromNode.gridX, toNode.gridX)
-            local endX = math.max(fromNode.gridX, toNode.gridX)
-            local pipeStartCol = startX * (NODE_W + NODE_GAP_X) + NODE_W
-            local pipeEndCol = endX * (NODE_W + NODE_GAP_X) - 1
-            local pipeLen = pipeEndCol - pipeStartCol + 1
-            if pipeLen > 0 then
-              state.gpu:setText(pipeStartCol, fromRow, string.rep("-", pipeLen))
-            end
-          end
-        else
-          -- Different rows: draw a vertical indicator
-          state.gpu:setForeground(0.5, 0.7, 1.0, 1.0)
-          state.gpu:setText(fromCol, fromRow + 1, "v")
-          state.gpu:setText(toCol, toRow - 1, "^")
-        end
+        drawConnection(fromNode.gridX, fromNode.gridY, toNode.gridX, toNode.gridY, gridStartRow)
       end
     end
 
@@ -897,13 +968,8 @@ local function renderTopology(scanResult, startRow)
       for _, conn in ipairs(netLayoutConns) do
         local fromNode = netLayoutNodes[conn.from]
         local toNode = netLayoutNodes[conn.to]
-        if fromNode and toNode and fromNode.gridY == toNode.gridY then
-          local fromCol = fromNode.gridX * (NODE_W + NODE_GAP_X) + NODE_W
-          local connRow = baseRow + fromNode.gridY * (NODE_H + NODE_GAP_Y)
-          local length = (toNode.gridX - fromNode.gridX) * (NODE_W + NODE_GAP_X) - NODE_W
-          if length > 0 then
-            drawPipe(fromCol, connRow, length)
-          end
+        if fromNode and toNode then
+          drawConnection(fromNode.gridX, fromNode.gridY, toNode.gridX, toNode.gridY, baseRow)
         end
       end
 
@@ -927,7 +993,11 @@ local function renderTopology(scanResult, startRow)
         colIdx = colIdx + 1
 
         if i < #net.data.elements and colIdx < nodesPerRow then
-          drawPipe(col + NODE_W, row, NODE_GAP_X)
+          local pipeRow = row + math.floor(NODE_H / 2)
+          if pipeRow >= 0 and pipeRow < H - 1 then
+            gpu:setForeground(table.unpack(COLORS.pipeLine))
+            gpu:setText(col + NODE_W, pipeRow, string.rep("-", NODE_GAP_X - 1) .. ">")
+          end
         end
 
         if colIdx >= nodesPerRow then
