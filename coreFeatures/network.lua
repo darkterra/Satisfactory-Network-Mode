@@ -2,7 +2,7 @@
 -- Inter-computer communication feature via NetworkCard.
 -- Provides a global NETWORK_BUS that other features can use to send/receive messages.
 
-local networkBus = filesystem.doFile(DRIVE_PATH .. "/lib/network_bus.lua")
+NETWORK_BUS = filesystem.doFile(DRIVE_PATH .. "/lib/network_bus.lua")
 
 -- Register config schema
 CONFIG_MANAGER.register("network", {
@@ -26,7 +26,7 @@ local basePort = netConfig.basePort or 100
 local portRange = netConfig.portRange or 899
 local identity = netConfig.identity or "Generic-PC-Slave"
 
-local success = networkBus.init(networkCard, {
+local success = NETWORK_BUS.init(networkCard, {
   basePort = basePort,
   portRange = portRange,
   identity = identity,
@@ -37,21 +37,18 @@ if not success then
   return
 end
 
--- Expose globally so other features can use it
-NETWORK_BUS = networkBus
-
 -- Print the local card UUID (needed by other computers to target this one)
-local cardId = networkBus.getCardId()
+local cardId = NETWORK_BUS.getCardId()
 print("[NETWORK] Card UUID: " .. (cardId or "unknown"))
 print("[NETWORK] Identity: " .. identity .. " | Base port: " .. basePort .. " | Port range: " .. portRange)
 
 -- Register a heartbeat/discovery channel by default
 -- Other computers can ping this channel to discover peers
-networkBus.registerChannel("discovery")
-networkBus.subscribe("discovery", function(senderCardId, senderIdentity, payload)
+NETWORK_BUS.registerChannel("discovery")
+NETWORK_BUS.subscribe("discovery", function(senderCardId, senderIdentity, payload)
   if payload and payload.type == "ping" then
     -- Respond with our identity
-    networkBus.sendTo(senderCardId, "discovery", {
+    NETWORK_BUS.sendTo(senderCardId, "discovery", {
       type = "pong",
       identity = identity,
       cardId = cardId,
@@ -70,7 +67,7 @@ if SIGNAL_HANDLERS then
     local args = { ... }
     local senderIdentity = args[1]     -- arg1: identity string
     local serializedPayload = args[2]  -- arg2: serialized data
-    networkBus.handleMessage(sender, port, senderIdentity, serializedPayload)
+    NETWORK_BUS.handleMessage(sender, port, senderIdentity, serializedPayload)
   end)
   print("[NETWORK] Signal handler registered - ready for inter-computer communication")
 else
@@ -82,13 +79,13 @@ end
 -- status so the Master can track the fleet. No-op on non-slave computers.
 local slaveConfig = CONFIG_MANAGER.getSection("slave")
 if slaveConfig and slaveConfig.type then
-  networkBus.registerChannel("slave_heartbeat")
+  NETWORK_BUS.registerChannel("slave_heartbeat")
   TASK_MANAGER.register("slave_heartbeat", {
     interval = 15,
     factory = function()
       return async(function()
         while true do
-          networkBus.publish("slave_heartbeat", {
+          NETWORK_BUS.publish("slave_heartbeat", {
             type = slaveConfig.type,
             identity = slaveConfig.identity or identity,
             cardId = cardId,

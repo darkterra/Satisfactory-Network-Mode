@@ -159,7 +159,7 @@ end
 -- ============================================================================
 
 --- Build the complete file list to send to a slave of a given type.
--- Includes common files (main.lua, lib/, features/network.lua, lib/network_bus.lua)
+-- Includes common files (main.lua, lib/, coreFeatures/network.lua, lib/network_bus.lua)
 -- plus type-specific files from slaves/<type>/.
 -- A config.lua is generated with the slave's type and identity.
 -- @param slaveType string
@@ -171,12 +171,12 @@ function MasterProvisioner.collectFilesForSlave(slaveType, identity)
   -- Common files that every slave needs
   local commonFiles = {
     "main.lua",
+    "coreFeatures/network.lua",
     "lib/config_manager.lua",
     "lib/config_ui.lua",
     "lib/component_registry.lua",
     "lib/task_manager.lua",
     "lib/network_bus.lua",
-    "features/a_network.lua",
   }
 
   for _, relPath in ipairs(commonFiles) do

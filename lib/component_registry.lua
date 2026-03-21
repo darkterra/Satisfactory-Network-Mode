@@ -13,6 +13,7 @@ local Registry = {
   },
   network = {},        -- dynamically populated by features via registerNetworkCategory()
   _networkMap = {},    -- { categoryName = className } registered by features
+  _claimed = {},       -- set of claimed component references (keyed by tostring(proxy))
 }
 
 --- Discover all PCI devices beyond what EEPROM reserved.
@@ -141,35 +142,76 @@ function Registry.getCategory(categoryName)
   return Registry.network[categoryName] or {}
 end
 
---- Get the best available GPU + screen pair for a feature (excluding EEPROM reserved).
--- Prefers GPU T2 over T1. Requires BOTH a spare GPU AND a spare screen.
--- @return gpu, screen, gpuType (or nil, nil, nil if either is missing)
-function Registry.getAvailableDisplay()
-  -- Prefer T2, fallback to T1
-  local gpu = Registry.pci.gpuT2[1]
-  local gpuType = "T2"
-  if not gpu then
-    gpu = Registry.pci.gpuT1[1]
-    gpuType = "T1"
+-- Internal claim helpers (not exposed on the Registry table)
+local function claimComponent(comp)
+  if comp then Registry._claimed[tostring(comp)] = true end
+end
+
+local function isComponentClaimed(comp)
+  return comp ~= nil and Registry._claimed[tostring(comp)] == true
+end
+
+local function getFirstUnclaimed(list)
+  for _, item in ipairs(list) do
+    if not isComponentClaimed(item) then
+      return item
+    end
   end
+  return nil
+end
+
+--- Get an available GPU + screen pair, claim both, and return them.
+-- @param preferredGpuType string|nil - "T1", "T2", or nil (T1 first, then T2)
+-- @param screenId string|nil - if provided, proxy this screen ID instead of auto-picking
+-- @return gpu, screen, gpuType (or nil, nil, nil if either is missing)
+function Registry.getAvailableDisplay(preferredGpuType, screenId)
+  local gpu, gpuType
+
+  if preferredGpuType == "T2" then
+    gpu = getFirstUnclaimed(Registry.pci.gpuT2)
+    gpuType = "T2"
+  elseif preferredGpuType == "T1" then
+    gpu = getFirstUnclaimed(Registry.pci.gpuT1)
+    gpuType = "T1"
+  else
+    gpu = getFirstUnclaimed(Registry.pci.gpuT1)
+    gpuType = "T1"
+    if not gpu then
+      gpu = getFirstUnclaimed(Registry.pci.gpuT2)
+      gpuType = "T2"
+    end
+  end
+
   if not gpu then
     return nil, nil, nil
   end
 
-  -- Prefer a spare PCI screen
-  local screen = Registry.pci.screens[1]
-  if screen then
-    return gpu, screen, gpuType
+  -- Resolve screen: explicit ID or first available
+  local screen
+  if screenId and screenId ~= "" then
+    local proxyOk, proxyResult = pcall(component.proxy, screenId)
+    if proxyOk and proxyResult then
+      screen = proxyResult
+    else
+      print("[REGISTRY] Screen not found: " .. tostring(screenId))
+    end
   end
 
-  -- Fallback to a network external screen (requires "screens" category to be registered)
-  local networkScreens = Registry.network["screens"] or {}
-  if #networkScreens > 0 then
-    return gpu, networkScreens[1], gpuType
+  if not screen then
+    screen = getFirstUnclaimed(Registry.pci.screens)
+  end
+  if not screen then
+    local networkScreens = Registry.network["screens"] or {}
+    screen = getFirstUnclaimed(networkScreens)
   end
 
-  -- No screen available
-  return nil, nil, nil
+  if not screen then
+    return nil, nil, nil
+  end
+
+  claimComponent(gpu)
+  claimComponent(screen)
+  return gpu, screen, gpuType
 end
 
 --- Get the first component in a network category (convenience).

@@ -29,26 +29,36 @@ SIGNAL_HANDLERS = SIGNAL_HANDLERS or {}
 TICK_HANDLERS = TICK_HANDLERS or {}
 
 -- Discover feature files and register enable/disable config for each
-local featureFiles = filesystem.children(DRIVE_PATH .. "/features/")
-if not featureFiles or #featureFiles == 0 then
+local coreFeatureFiles = filesystem.children(DRIVE_PATH .. "/coreFeatures/")
+if not coreFeatureFiles or #coreFeatureFiles == 0 then
+  computer.panic("[MAIN] No core features found in /coreFeatures")
+end
+local businessFeatureFiles = filesystem.children(DRIVE_PATH .. "/features/")
+if not businessFeatureFiles or #businessFeatureFiles == 0 then
   computer.panic("[MAIN] No features found in /features")
 end
 
 local featureSchemaFields = {}
 local featureNames = {}
-for _, featureFile in ipairs(featureFiles) do
-  local featurePath = DRIVE_PATH .. "/features/" .. featureFile
-  if filesystem.exists(featurePath) and filesystem.isFile(featurePath) then
-    local featureName = featureFile:match("^(.+)%.lua$") or featureFile
-    table.insert(featureNames, { name = featureName, path = featurePath })
-    table.insert(featureSchemaFields, {
-      key = featureName,
-      label = featureName .. " (enabled)",
-      type = "boolean",
-      default = true,
-    })
+
+local function prepareLoadingFiles(folderPath, featureFiles)
+  for _, featureFile in ipairs(featureFiles) do
+    local featurePath = folderPath .. "/" .. featureFile
+    if filesystem.exists(featurePath) and filesystem.isFile(featurePath) then
+      local featureName = featureFile:match("^(.+)%.lua$") or featureFile
+      table.insert(featureNames, { name = featureName, path = featurePath })
+      table.insert(featureSchemaFields, {
+        key = featureName,
+        label = featureName .. " (enabled)",
+        type = "boolean",
+        default = true,
+      })
+    end
   end
 end
+
+prepareLoadingFiles(DRIVE_PATH .. "/coreFeatures", coreFeatureFiles)
+prepareLoadingFiles(DRIVE_PATH .. "/features", businessFeatureFiles)
 
 CONFIG_MANAGER.register("features", featureSchemaFields)
 
