@@ -100,6 +100,7 @@ if trainMap and trainConfig.mapScreenId and trainConfig.mapScreenId ~= "" then
     mapReady = trainMap.init(mapGpu, mapScreen, {
       screenWidth = trainConfig.mapWidth or 1920,
       screenHeight = trainConfig.mapHeight or 1080,
+      drivePath = DRIVE_PATH,
     })
     print("[TRAIN] Map display initialized (GPU T2, " .. (trainConfig.mapWidth or 1920) .. "x" .. (trainConfig.mapHeight or 1080) .. ")")
   else
@@ -136,12 +137,16 @@ if NETWORK_BUS then
     
     local key = data.identity or senderIdentity or senderCardId
     if key then
-      railStates[key] = {
-        lastUpdate = computer.millis(),
-        signals = data.signals or {},
-        switches = data.switches or {},
-        tracks = data.tracks or {},
-      }
+      local existing = railStates[key] or {}
+      existing.lastUpdate = computer.millis()
+      existing.signals = data.signals or {}
+      existing.switches = data.switches or {}
+      if data.tracks then
+        existing.tracks = data.tracks
+      elseif not existing.tracks then
+        existing.tracks = {}
+      end
+      railStates[key] = existing
       renderDirty = true
     end
   end)
@@ -288,6 +293,15 @@ local function performScan()
 
   scanResult.railStates = railStates
 
+  trainMonitor.tagDeadEndStations(scanResult.stations, railStates)
+
+  if controlEnabled and trainMap then
+    local flags = trainMap.getTrainFlags()
+    if flags and next(flags) then
+      trainController.enforceFlags(scanResult, flags)
+    end
+  end
+
   if broadcastEnabled and NETWORK_BUS then
     local payload = buildNetworkPayload(scanResult)
     NETWORK_BUS.publish("train_states", payload)
@@ -330,30 +344,34 @@ end
 -- Task registration
 -- ============================================================================
 
-TASK_MANAGER.register("train_scan", {
-  interval = scanInterval,
-  factory = function()
-    return async(function()
-      while true do
-        TASK_MANAGER.heartbeat("train_scan")
-        performScan()
-        performRender(true)
-        sleep(scanInterval)
-      end
-    end)
-  end,
-})
+local RENDER_POLL_INTERVAL = 0.5
+local scanIntervalMs = scanInterval * 1000
 
--- Render task: checks dirty flag every 2s, only redraws when data changed
-local renderInterval = 2
-TASK_MANAGER.register("train_render", {
-  interval = renderInterval,
+TASK_MANAGER.register("train_monitor", {
+  interval = 120,
   factory = function()
     return async(function()
+      if NETWORK_BUS then
+        NETWORK_BUS.publish("rail_commands", { action = "request_topology" })
+      end
+
+      local nextScanAt = 0
       while true do
-        TASK_MANAGER.heartbeat("train_render")
-        performRender()
-        sleep(renderInterval)
+        TASK_MANAGER.heartbeat("train_monitor")
+        local now = computer.millis()
+
+        if now >= nextScanAt then
+          local sOk, sErr = pcall(performScan)
+          if not sOk then print("[TRAIN] Scan error: " .. tostring(sErr)) end
+          local rOk, rErr = pcall(performRender, true)
+          if not rOk then print("[TRAIN] Render error: " .. tostring(rErr)) end
+          nextScanAt = computer.millis() + scanIntervalMs
+        elseif renderDirty then
+          local rOk, rErr = pcall(performRender)
+          if not rOk then print("[TRAIN] Render error: " .. tostring(rErr)) end
+        end
+
+        sleep(RENDER_POLL_INTERVAL)
       end
     end)
   end,

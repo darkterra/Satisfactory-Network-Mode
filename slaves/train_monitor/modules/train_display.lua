@@ -230,23 +230,19 @@ function TrainDisplay.init(gpu, screen, options)
   state.enabled = true
 
   event.listen(gpu)
-  if SIGNAL_HANDLERS then
-    SIGNAL_HANDLERS["OnMouseDown"] = SIGNAL_HANDLERS["OnMouseDown"] or {}
-    table.insert(SIGNAL_HANDLERS["OnMouseDown"], function(signal, sender, ...)
-      if sender == state.rawGpu then
-        if isGpuT1 then
-          -- T1: OnMouseDown(x, y, btn) - integer character coords
-          local x, y, btn = ...
-          handleClick(x, y, btn)
-        else
-          -- T2: OnMouseDown(position, modifiers) - position is Vector2D in pixels
-          local position, modifiers = ...
-          local cx, cy = pixelToChar(position.x, position.y)
-          handleClick(cx, cy, modifiers)
-        end
+  event.registerListener(
+    event.filter{event = "OnMouseDown", sender = gpu},
+    function(signal, sender, ...)
+      if isGpuT1 then
+        local x, y, btn = ...
+        handleClick(x, y, btn)
+      else
+        local position, modifiers = ...
+        local cx, cy = pixelToChar(position.x, position.y)
+        handleClick(cx, cy, modifiers)
       end
-    end)
-  end
+    end
+  )
 
   if not isGpuT1 then
     print("[TRAIN_DSP] GPU T2 - using character emulation layer")

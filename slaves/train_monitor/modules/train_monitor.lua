@@ -342,6 +342,7 @@ local function collectTrainData(train, cargoPlatforms)
 
     if vIdx == 1 then
       trainData.speed = math.abs(movement.speed)
+      trainData.rawSpeed = movement.speed
       trainData.maxSpeed = movement.maxSpeed
       trainData.isMoving = movement.isMoving
     end
@@ -754,6 +755,67 @@ function TrainMonitor.printReport(scanResult)
       for _, wf in ipairs(td.wagonFills) do
         for _, inv in ipairs(wf.inventories) do
           print("  Wagon#" .. wf.vehicleIndex .. ": " .. inv.fillPercent .. "%")
+        end
+      end
+    end
+  end
+end
+
+-- ============================================================================
+-- Topology-based dead-end detection (safe — no game API calls on tracks)
+-- ============================================================================
+
+--- Tag stations as dead-end based on rail topology from rail_controller data.
+--- A dead-end track endpoint is one that no other track segment shares.
+--- Stations near such endpoints are marked isDeadEnd = true.
+--- @param stations table - array of station data from scan
+--- @param railStates table - keyed by controller identity, each has .tracks
+function TrainMonitor.tagDeadEndStations(stations, railStates)
+  if not stations or not railStates then return end
+
+  local endpoints = {}
+  for _, rs in pairs(railStates) do
+    for _, seg in ipairs(rs.tracks or {}) do
+      if seg.startLocation then table.insert(endpoints, seg.startLocation) end
+      if seg.endLocation then table.insert(endpoints, seg.endLocation) end
+    end
+  end
+
+  if #endpoints == 0 then
+    for _, st in ipairs(stations) do st.isDeadEnd = false end
+    return
+  end
+
+  local CONNECT_DIST_SQ = 200 * 200
+  local deadEndPoints = {}
+
+  for i, ep in ipairs(endpoints) do
+    local hasNeighbor = false
+    for j, other in ipairs(endpoints) do
+      if i ~= j then
+        local dx = (ep.x or 0) - (other.x or 0)
+        local dy = (ep.y or 0) - (other.y or 0)
+        if dx * dx + dy * dy < CONNECT_DIST_SQ then
+          hasNeighbor = true
+          break
+        end
+      end
+    end
+    if not hasNeighbor then
+      table.insert(deadEndPoints, ep)
+    end
+  end
+
+  local STATION_DIST_SQ = 3000 * 3000
+  for _, st in ipairs(stations) do
+    st.isDeadEnd = false
+    if st.location and #deadEndPoints > 0 then
+      for _, dep in ipairs(deadEndPoints) do
+        local dx = (st.location.x or 0) - (dep.x or 0)
+        local dy = (st.location.y or 0) - (dep.y or 0)
+        if dx * dx + dy * dy < STATION_DIST_SQ then
+          st.isDeadEnd = true
+          break
         end
       end
     end

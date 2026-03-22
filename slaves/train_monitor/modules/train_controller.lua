@@ -300,6 +300,258 @@ function TrainController.getAllForcedRoutes()
 end
 
 -- ============================================================================
+-- Flag enforcement state
+-- ============================================================================
+
+local noReverseState = {}     -- trainId → { handled, turnaroundName, insertedIndex }
+local pausedByPriority = {}   -- trainId → true
+
+local PRIORITY_APPROACH_DIST = 20000   -- 200m — priority train "near switch"
+local PRIORITY_CONFLICT_DIST = 40000   -- 400m — non-priority train "near same switch"
+
+local function vecDist(a, b)
+  if not a or not b then return math.huge end
+  local dx = (a.x or 0) - (b.x or 0)
+  local dy = (a.y or 0) - (b.y or 0)
+  local dz = (a.z or 0) - (b.z or 0)
+  return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+local function findTrainById(scanResult, trainId)
+  if not scanResult or not scanResult.trains then return nil end
+  for _, td in ipairs(scanResult.trains) do
+    if td.trainId == trainId then return td end
+  end
+  return nil
+end
+
+--- Remove the turnaround stop we previously inserted by searching the timetable.
+local function removeTurnaroundStop(trainId, nrState)
+  if not nrState or not nrState.turnaroundName then return end
+  local train = getProxy(trainId)
+  if not train or not train.hasTimeTable then return end
+  local ok, tt = pcall(train.getTimeTable, train)
+  if not ok or not tt then return end
+
+  local idx = nrState.insertedIndex
+  if idx and idx < tt.numStops then
+    local sOk, stop = pcall(tt.getStop, tt, idx)
+    if sOk and stop and stop.station then
+      local nOk, name = pcall(function() return stop.station.name end)
+      if nOk and name == nrState.turnaroundName then
+        pcall(tt.removeStop, tt, idx)
+        return
+      end
+    end
+  end
+
+  for i = 0, tt.numStops - 1 do
+    local sOk, stop = pcall(tt.getStop, tt, i)
+    if sOk and stop and stop.station then
+      local nOk, name = pcall(function() return stop.station.name end)
+      if nOk and name == nrState.turnaroundName then
+        pcall(tt.removeStop, tt, i)
+        return
+      end
+    end
+  end
+end
+
+-- ============================================================================
+-- No-Reverse enforcement
+-- ============================================================================
+
+--- Monitors noReverse-flagged trains. When one drives in reverse,
+--- inserts the nearest dead-end station as an immediate turnaround stop.
+--- Removes the turnaround stop once the train is going forward again.
+local function enforceNoReverse(scanResult, trainFlags)
+  if not scanResult.trains or not scanResult.stations then return end
+
+  local deadEndNoCargo = {}
+  local deadEndAll = {}
+  for _, st in ipairs(scanResult.stations) do
+    if st.isDeadEnd and st.proxy and st.location then
+      table.insert(deadEndAll, st)
+      local cargoCount = 0
+      for _, plat in ipairs(st.platforms or {}) do
+        if plat.isCargo then cargoCount = cargoCount + 1 end
+      end
+      if cargoCount == 0 then table.insert(deadEndNoCargo, st) end
+    end
+  end
+  local deadEndStations = #deadEndNoCargo > 0 and deadEndNoCargo or deadEndAll
+
+  for _, td in ipairs(scanResult.trains) do
+    local flags = trainFlags[td.trainId]
+    if not flags or not flags.noReverse then
+      if noReverseState[td.trainId] then
+        removeTurnaroundStop(td.trainId, noReverseState[td.trainId])
+        noReverseState[td.trainId] = nil
+      end
+    else
+      local nrs = noReverseState[td.trainId]
+
+      if td.rawSpeed and td.rawSpeed < -1 and (not nrs or not nrs.handled) then
+        if #deadEndStations == 0 then goto nextTrain end
+
+        local nearest, nearestDist = nil, math.huge
+        if td.worldLocation then
+          for _, st in ipairs(deadEndStations) do
+            local dist = vecDist(td.worldLocation, st.location)
+            if dist < nearestDist then nearest = st; nearestDist = dist end
+          end
+        end
+
+        if nearest and nearest.proxy then
+          local train = getProxy(td.trainId)
+          if train then
+            local tt = train.hasTimeTable and train:getTimeTable() or nil
+            if not tt then
+              local cOk, newTT = pcall(train.newTimeTable, train)
+              if cOk and newTT then tt = newTT end
+            end
+            if tt then
+              local currentIdx = tt:getCurrentStop() or 0
+              local aOk = pcall(tt.addStop, tt, currentIdx, nearest.proxy, {})
+              if aOk then
+                pcall(tt.setCurrentStop, tt, currentIdx)
+                noReverseState[td.trainId] = {
+                  handled = true,
+                  turnaroundName = nearest.name,
+                  insertedIndex = currentIdx,
+                }
+              end
+            end
+          end
+        end
+
+      elseif td.rawSpeed and td.rawSpeed >= 0 and nrs and nrs.handled then
+        removeTurnaroundStop(td.trainId, nrs)
+        noReverseState[td.trainId] = nil
+      end
+    end
+    ::nextTrain::
+  end
+end
+
+-- ============================================================================
+-- Priority enforcement
+-- ============================================================================
+
+--- Pauses non-priority trains that are near the same switch as an approaching
+--- priority train. Re-enables them once the conflict is resolved.
+local function enforcePriority(scanResult, trainFlags, railStates)
+  if not scanResult.trains then return end
+
+  local allSwitches = {}
+  if railStates then
+    for _, rs in pairs(railStates) do
+      for _, sw in ipairs(rs.switches or {}) do
+        if sw.location then table.insert(allSwitches, sw) end
+      end
+    end
+  end
+
+  local priorityTrains, nonPriorityTrains = {}, {}
+  for _, td in ipairs(scanResult.trains) do
+    if td.worldLocation then
+      local flags = trainFlags[td.trainId]
+      if flags and flags.priority then
+        table.insert(priorityTrains, td)
+      else
+        table.insert(nonPriorityTrains, td)
+      end
+    end
+  end
+
+  if #priorityTrains == 0 then
+    for trainId, _ in pairs(pausedByPriority) do
+      local td = findTrainById(scanResult, trainId)
+      if td then TrainController.setAutopilot(td, true) end
+    end
+    pausedByPriority = {}
+    return
+  end
+
+  if #allSwitches == 0 then return end
+
+  local conflictSwitchIds = {}
+  for _, sw in ipairs(allSwitches) do
+    for _, pt in ipairs(priorityTrains) do
+      if vecDist(pt.worldLocation, sw.location) < PRIORITY_APPROACH_DIST then
+        conflictSwitchIds[sw.id] = true
+        break
+      end
+    end
+  end
+
+  local shouldPause = {}
+  for _, td in ipairs(nonPriorityTrains) do
+    for _, sw in ipairs(allSwitches) do
+      if conflictSwitchIds[sw.id] and vecDist(td.worldLocation, sw.location) < PRIORITY_CONFLICT_DIST then
+        local isOpposite = false
+        for _, pt in ipairs(priorityTrains) do
+          if vecDist(pt.worldLocation, sw.location) < PRIORITY_APPROACH_DIST then
+            local dx1 = pt.worldLocation.x - sw.location.x
+            local dy1 = pt.worldLocation.y - sw.location.y
+            local dx2 = td.worldLocation.x - sw.location.x
+            local dy2 = td.worldLocation.y - sw.location.y
+            if dx1 * dx2 + dy1 * dy2 <= 0 then
+              isOpposite = true
+              break
+            end
+          end
+        end
+        if isOpposite then
+          shouldPause[td.trainId] = true
+          break
+        end
+      end
+    end
+  end
+
+  for trainId, _ in pairs(shouldPause) do
+    if not pausedByPriority[trainId] then
+      local td = findTrainById(scanResult, trainId)
+      if td and td.isSelfDriving then
+        TrainController.setAutopilot(td, false)
+        pausedByPriority[trainId] = true
+      end
+    end
+  end
+
+  local toResume = {}
+  for trainId, _ in pairs(pausedByPriority) do
+    if not shouldPause[trainId] then table.insert(toResume, trainId) end
+  end
+  for _, trainId in ipairs(toResume) do
+    local td = findTrainById(scanResult, trainId)
+    if td then TrainController.setAutopilot(td, true) end
+    pausedByPriority[trainId] = nil
+  end
+end
+
+-- ============================================================================
+-- Public enforcement entry point
+-- ============================================================================
+
+--- Run all flag enforcement logic. Called after each scan cycle.
+--- @param scanResult table - latest scan data with trains, stations, railStates
+--- @param trainFlags table - trainId → { priority, noReverse }
+function TrainController.enforceFlags(scanResult, trainFlags)
+  if not scanResult or not trainFlags or not next(trainFlags) then return end
+  local ok1, err1 = pcall(enforceNoReverse, scanResult, trainFlags)
+  if not ok1 then print("[TRAIN_CTRL] noReverse error: " .. tostring(err1)) end
+  local ok2, err2 = pcall(enforcePriority, scanResult, trainFlags, scanResult.railStates)
+  if not ok2 then print("[TRAIN_CTRL] priority error: " .. tostring(err2)) end
+end
+
+--- Returns the set of trains currently paused by priority enforcement.
+function TrainController.getPausedByPriority()
+  return pausedByPriority
+end
+
+-- ============================================================================
 -- Remote command handler (from network bus)
 -- ============================================================================
 

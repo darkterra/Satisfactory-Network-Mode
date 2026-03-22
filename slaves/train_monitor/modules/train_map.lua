@@ -82,6 +82,49 @@ local routeEditor = {
 }
 
 -- ============================================================================
+-- State persistence (storage zones, train flags)
+-- ============================================================================
+
+local statePath = nil
+
+local function saveState()
+  if not statePath then return end
+  local ok, err = pcall(function()
+    local f = filesystem.open(statePath, "w")
+    if not f then return end
+    f:write("return {\n")
+    f:write("  trainFlags = {\n")
+    for id, flags in pairs(trainFlags) do
+      f:write("    [" .. string.format("%q", id) .. "] = {")
+      f:write(" priority = " .. tostring(flags.priority or false))
+      f:write(", noReverse = " .. tostring(flags.noReverse or false))
+      f:write(" },\n")
+    end
+    f:write("  },\n")
+    f:write("  storageZones = {\n")
+    for id, _ in pairs(storageZones) do
+      f:write("    [" .. string.format("%q", id) .. "] = true,\n")
+    end
+    f:write("  },\n")
+    f:write("}\n")
+    f:close()
+  end)
+  if not ok then
+    print("[TRAIN_MAP] Failed to save state: " .. tostring(err))
+  end
+end
+
+local function loadState()
+  if not statePath then return end
+  if not filesystem.exists(statePath) then return end
+  local ok, data = pcall(filesystem.doFile, statePath)
+  if ok and type(data) == "table" then
+    trainFlags = data.trainFlags or {}
+    storageZones = data.storageZones or {}
+  end
+end
+
+-- ============================================================================
 -- Initialization
 -- ============================================================================
 
@@ -96,20 +139,26 @@ function TrainMap.init(gpu, screen, options)
   CONTENT_W = SCREEN_W - 2 * MARGIN
   CONTENT_H = SCREEN_H - 2 * MARGIN
 
+  local drivePath = options.drivePath or DRIVE_PATH
+  if drivePath then
+    statePath = drivePath .. "/train_map_state.lua"
+    loadState()
+  end
+
   state.gpu = gpu
   state.screen = screen
   gpu:bindScreen(screen)
   state.enabled = true
 
   event.listen(gpu)
-  if SIGNAL_HANDLERS then
-    SIGNAL_HANDLERS["OnMouseDown"] = SIGNAL_HANDLERS["OnMouseDown"] or {}
-    table.insert(SIGNAL_HANDLERS["OnMouseDown"], function(signal, sender, position, modifiers)
-      if sender == state.gpu and position then
+  event.registerListener(
+    event.filter{event = "OnMouseDown", sender = gpu},
+    function(e, sender, position, modifiers)
+      if position then
         TrainMap.handleClick(position.x, position.y, modifiers)
       end
-    end)
-  end
+    end
+  )
 
   print("[TRAIN_MAP] Map display initialized (" .. SCREEN_W .. "x" .. SCREEN_H .. ")")
   return true
@@ -208,6 +257,15 @@ local function drawPolyline(gpu, points, thickness, color)
   for i = 1, #points - 1 do
     drawLine(gpu, points[i].x, points[i].y, points[i + 1].x, points[i + 1].y, thickness, color)
   end
+end
+
+--- Draw a button in the selection panel. ctx.py is advanced automatically.
+--- ctx = { pX, pW, py, btnH }
+local function drawPanelButton(gpu, ctx, label, action, color, actionData)
+  gpu:drawRect({ x = ctx.pX + 6, y = ctx.py }, { x = ctx.pW - 12, y = ctx.btnH }, rgba(C.buttonBg), "", 0)
+  drawLabel(gpu, ctx.pX + 12, ctx.py + 4, label, 11, color or rgba(C.buttonText), true)
+  table.insert(panelButtons, { x = ctx.pX + 6, y = ctx.py, w = ctx.pW - 12, h = ctx.btnH, action = action, actionData = actionData })
+  ctx.py = ctx.py + ctx.btnH + 4
 end
 
 local function buildSegmentPolyline(bounds, startLoc, endLoc, waypoints)
@@ -439,7 +497,10 @@ function TrainMap.render(scanResult)
         local name = st.name
         if #name > 20 then name = name:sub(1, 18) .. ".." end
         local nameColor = isStorage and rgba(C.unloading) or rgba(C.station)
-        drawLabel(gpu, boxX + 4, boxY + 2, (isStorage and "[S] " or "") .. name, 12, nameColor, true)
+        local prefix = ""
+        if isStorage then prefix = "[S] " end
+        if st.isDeadEnd then prefix = prefix .. "[D] " end
+        drawLabel(gpu, boxX + 4, boxY + 2, prefix .. name, 12, nameColor, true)
 
         local pRow = boxY + 18
         for pIdx, plat in ipairs(st.platforms or {}) do
@@ -492,12 +553,17 @@ function TrainMap.render(scanResult)
         if flags.priority then drawCircle(gpu, badgeX, sy - 4, 3, rgba(C.priority)); badgeX = badgeX - 8 end
         if flags.noReverse then drawCircle(gpu, badgeX, sy - 4, 3, rgba(C.noReverse)) end
 
+        local pausedSet = state.controller and state.controller.getPausedByPriority and state.controller.getPausedByPriority() or {}
+        local isPaused = pausedSet[td.trainId]
+
         local name = td.name
         if #name > 16 then name = name:sub(1, 14) .. ".." end
-        drawLabel(gpu, sx + 10, sy - 8, name, 11, rgba(C.trainLabel), true)
+        drawLabel(gpu, sx + 10, sy - 8, name, 11, isPaused and rgba(C.signalStop) or rgba(C.trainLabel), true)
         drawLabel(gpu, sx + 10, sy + 4, string.format("%.0f km/h", math.abs(td.speed or 0) * 0.036), 9, rgba(C.dim), true)
 
-        if td.isDocked then
+        if isPaused then
+          drawLabel(gpu, sx + 10, sy + 16, "PAUSED (Priority)", 8, rgba(C.signalStop), true)
+        elseif td.isDocked then
           drawLabel(gpu, sx + 10, sy + 16, "DOCKED: " .. (td.dockStateLabel or ""), 8, rgba(C.loading), true)
         end
 
@@ -530,6 +596,42 @@ function TrainMap.render(scanResult)
     drawLabel(gpu, MARGIN, statsY + 14, railCtrlCount .. " rail ctrl  " .. sigCount .. " signals  " .. swCount .. " switches", 11, rgba(C.text), true)
   else
     drawLabel(gpu, MARGIN, statsY + 14, "No rail_controller connected", 10, rgba(C.dim), true)
+  end
+
+  -- ======================================================================
+  -- 5b. Train navigation bar
+  -- ======================================================================
+
+  if trainCount > 0 and not ttEditor.active and not routeEditor.active then
+    local navY = statsY + 32
+    local navBtnW = 70
+    local navBtnH = 18
+
+    gpu:drawRect({ x = MARGIN, y = navY - 2 }, { x = navBtnW, y = navBtnH }, rgba(C.buttonBg), "", 0)
+    drawLabel(gpu, MARGIN + 8, navY, "[< Prev]", 11, rgba(C.buttonText), true)
+    table.insert(panelButtons, { x = MARGIN, y = navY - 2, w = navBtnW, h = navBtnH, action = "nav_prev_train" })
+
+    local nameX = MARGIN + navBtnW + 10
+    local navTrainName = "No train selected"
+    local navTrainColor = rgba(C.dim)
+    if selection.type == "train" and selection.data then
+      navTrainName = selection.data.name or "?"
+      navTrainColor = rgba(C.trainLabel)
+    end
+    if #navTrainName > 28 then navTrainName = navTrainName:sub(1, 26) .. ".." end
+    drawLabel(gpu, nameX, navY, "Train: " .. navTrainName, 11, navTrainColor, true)
+
+    local nextBtnX = nameX + 260
+    gpu:drawRect({ x = nextBtnX, y = navY - 2 }, { x = navBtnW, y = navBtnH }, rgba(C.buttonBg), "", 0)
+    drawLabel(gpu, nextBtnX + 8, navY, "[Next >]", 11, rgba(C.buttonText), true)
+    table.insert(panelButtons, { x = nextBtnX, y = navY - 2, w = navBtnW, h = navBtnH, action = "nav_next_train" })
+
+    if selection.type == "train" then
+      local deselX = nextBtnX + navBtnW + 10
+      gpu:drawRect({ x = deselX, y = navY - 2 }, { x = 80, y = navBtnH }, rgba(C.buttonBg), "", 0)
+      drawLabel(gpu, deselX + 6, navY, "[Deselect]", 10, rgba(C.dim), true)
+      table.insert(panelButtons, { x = deselX, y = navY - 2, w = 80, h = navBtnH, action = "nav_deselect" })
+    end
   end
 
   -- ======================================================================
@@ -653,13 +755,7 @@ function TrainMap.render(scanResult)
 
     local py = pY + 6
     local d = selection.data
-
-    local function addBtn(label, action, color, actionData)
-      gpu:drawRect({ x = pX + 6, y = py }, { x = pW - 12, y = btnH }, rgba(C.buttonBg), "", 0)
-      drawLabel(gpu, pX + 12, py + 4, label, 11, color or rgba(C.buttonText), true)
-      table.insert(panelButtons, { x = pX + 6, y = py, w = pW - 12, h = btnH, action = action, actionData = actionData })
-      py = py + btnH + 4
-    end
+    local btnCtx = { pX = pX, pW = pW, py = 0, btnH = btnH }
 
     if selection.type == "train" then
       local flags = trainFlags[d.trainId] or {}
@@ -689,15 +785,22 @@ function TrainMap.render(scanResult)
         drawLabel(gpu, pX + 6, py, "NO-REVERSE", 10, rgba(C.noReverse), true)
         py = py + lineH
       end
+      local pausedSet = state.controller and state.controller.getPausedByPriority and state.controller.getPausedByPriority() or {}
+      if pausedSet[d.trainId] then
+        drawLabel(gpu, pX + 6, py, "PAUSED (Priority yield)", 10, rgba(C.signalStop), true)
+        py = py + lineH
+      end
       py = py + 6
 
-      addBtn(d.isSelfDriving and "[ Disable Autopilot ]" or "[ Enable Autopilot ]", "toggle_autopilot")
-      addBtn("[ Edit Timetable ]", "edit_timetable")
-      addBtn("[ Edit Forced Route ]", "edit_forced_route")
-      addBtn("[ Clear Timetable ]", "clear_timetable")
-      addBtn(flags.priority and "[ Remove Priority ]" or "[ Set Priority ]", "toggle_priority")
-      addBtn(flags.noReverse and "[ Allow Reverse ]" or "[ Lock Direction ]", "toggle_no_reverse")
-      addBtn("[ Send to Storage ]", "send_to_storage")
+      btnCtx.py = py
+      drawPanelButton(gpu, btnCtx, d.isSelfDriving and "[ Disable Autopilot ]" or "[ Enable Autopilot ]", "toggle_autopilot")
+      drawPanelButton(gpu, btnCtx, "[ Edit Timetable ]", "edit_timetable")
+      drawPanelButton(gpu, btnCtx, "[ Edit Forced Route ]", "edit_forced_route")
+      drawPanelButton(gpu, btnCtx, "[ Clear Timetable ]", "clear_timetable")
+      drawPanelButton(gpu, btnCtx, flags.priority and "[ Remove Priority ]" or "[ Set Priority ]", "toggle_priority")
+      drawPanelButton(gpu, btnCtx, flags.noReverse and "[ Allow Reverse ]" or "[ Lock Direction ]", "toggle_no_reverse")
+      drawPanelButton(gpu, btnCtx, "[ Send to Storage ]", "send_to_storage")
+      py = btnCtx.py
 
     elseif selection.type == "station" then
       local isStorage = storageZones[d.id] ~= nil
@@ -707,6 +810,10 @@ function TrainMap.render(scanResult)
       py = py + lineH
       if isStorage then
         drawLabel(gpu, pX + 6, py, "STORAGE ZONE", 10, rgba(C.unloading), true)
+        py = py + lineH
+      end
+      if d.isDeadEnd then
+        drawLabel(gpu, pX + 6, py, "DEAD END (Turnaround)", 10, rgba(C.noReverse), true)
         py = py + lineH
       end
       for pIdx, plat in ipairs(d.platforms or {}) do
@@ -741,7 +848,9 @@ function TrainMap.render(scanResult)
         end
       end
       py = py + 6
-      addBtn(isStorage and "[ Unmark Storage Zone ]" or "[ Mark as Storage Zone ]", "toggle_storage")
+      btnCtx.py = py
+      drawPanelButton(gpu, btnCtx, isStorage and "[ Unmark Storage Zone ]" or "[ Mark as Storage Zone ]", "toggle_storage")
+      py = btnCtx.py
 
     elseif selection.type == "switch" then
       drawLabel(gpu, pX + 6, py, "SWITCH", 13, rgba(C.switchNorm), true)
@@ -753,14 +862,16 @@ function TrainMap.render(scanResult)
         py = py + lineH
       end
       py = py + 6
-      addBtn("[ Toggle Position ]", "toggle_switch")
+      btnCtx.py = py
+      drawPanelButton(gpu, btnCtx, "[ Toggle Position ]", "toggle_switch")
       if d.numPositions and d.numPositions > 0 then
         for ci = 0, d.numPositions - 1 do
           local label = "[ Force Pos " .. ci .. " ]"
           if ci == d.position then label = label .. " (current)" end
-          addBtn(label, "force_switch_pos", nil, ci)
+          drawPanelButton(gpu, btnCtx, label, "force_switch_pos", nil, ci)
         end
       end
+      py = btnCtx.py
 
     elseif selection.type == "signal" then
       drawLabel(gpu, pX + 6, py, "SIGNAL: " .. (d.aspectLabel or "?"), 13,
@@ -867,12 +978,9 @@ function TrainMap.handleClick(posX, posY, modifiers)
   TrainMap.immediateRefresh()
 end
 
---- Re-render immediately using the last scan data (no new scan needed).
+--- Signal that the display needs refreshing (render happens on next task poll).
 function TrainMap.immediateRefresh()
   if TrainMap.markDirty then TrainMap.markDirty() end
-  if state.lastScanResult then
-    TrainMap.render(state.lastScanResult)
-  end
 end
 
 -- ============================================================================
@@ -950,6 +1058,35 @@ function TrainMap.executeAction(action, actionData)
     return
   end
 
+  -- Train navigation (no selection required)
+  if action == "nav_next_train" or action == "nav_prev_train" then
+    if scan and scan.trains and #scan.trains > 0 then
+      local trains = scan.trains
+      local currentIdx = 0
+      if selection.type == "train" and selection.data then
+        for i, td in ipairs(trains) do
+          if td.trainId == selection.data.trainId then currentIdx = i; break end
+        end
+      end
+      local nextIdx
+      if action == "nav_next_train" then
+        nextIdx = (currentIdx % #trains) + 1
+      else
+        nextIdx = currentIdx <= 1 and #trains or (currentIdx - 1)
+      end
+      selection.type = "train"
+      selection.data = trains[nextIdx]
+      selection.controller = nil
+    end
+    return
+  end
+  if action == "nav_deselect" then
+    selection.type = nil
+    selection.data = nil
+    selection.controller = nil
+    return
+  end
+
   if not d then return end
 
   if action == "toggle_autopilot" and selection.type == "train" then
@@ -990,10 +1127,12 @@ function TrainMap.executeAction(action, actionData)
   elseif action == "toggle_priority" and selection.type == "train" then
     trainFlags[d.trainId] = trainFlags[d.trainId] or {}
     trainFlags[d.trainId].priority = not trainFlags[d.trainId].priority
+    saveState()
 
   elseif action == "toggle_no_reverse" and selection.type == "train" then
     trainFlags[d.trainId] = trainFlags[d.trainId] or {}
     trainFlags[d.trainId].noReverse = not trainFlags[d.trainId].noReverse
+    saveState()
 
   elseif action == "send_to_storage" and selection.type == "train" then
     TrainMap.sendTrainToStorage(d)
@@ -1018,6 +1157,7 @@ function TrainMap.executeAction(action, actionData)
     else
       storageZones[d.id] = true
     end
+    saveState()
   end
 end
 

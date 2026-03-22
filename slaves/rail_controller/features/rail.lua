@@ -1,18 +1,14 @@
 -- features/rail.lua
 -- Railroad infrastructure controller feature for Slave satellite computers.
 --
--- This slave type monitors railroad signals and switches connected to its
--- local FicsIt component network. It publishes their state (signal aspects,
--- switch positions, track direction/length) to the network bus so that
--- the train_monitor can aggregate and display them on the map.
+-- Two scan phases:
+--   1. Topology scan (boot + peer change + every N minutes):
+--      Full BFS track walk + signal/switch topology probe.
+--   2. State scan (every 1-2 seconds):
+--      Lightweight read of signal aspects and switch positions.
 --
--- It also listens for commands from train_monitor to:
---   - Toggle or set switch positions
---   - Force/release switch positions for routed trains
---   - Apply forced routes (series of switch positions for a specific train)
---
--- Deployment: place one rail_controller slave per section of track,
--- connected via FicsIt network cable to the signals and switches in that area.
+-- Peer change detection triggers topology rescan so controllers
+-- dynamically repartition the network as peers are added or removed.
 
 local scanner = filesystem.doFile(DRIVE_PATH .. "/modules/rail_scanner.lua")
 
@@ -21,12 +17,12 @@ local scanner = filesystem.doFile(DRIVE_PATH .. "/modules/rail_scanner.lua")
 -- ============================================================================
 
 CONFIG_MANAGER.register("rail", {
-  { key = "scanInterval",     label = "Scan interval (sec)",           type = "number",  default = 2 },
-  { key = "outputMode",       label = "Output (auto/console)",         type = "string",  default = "console" },
-  { key = "broadcastResults", label = "Broadcast via network",         type = "boolean", default = true },
+  { key = "stateInterval",     label = "State poll interval (sec)",     type = "number",  default = 2 },
+  { key = "topologyInterval",  label = "Topology rescan interval (sec)", type = "number",  default = 300 },
+  { key = "outputMode",        label = "Output (auto/console)",         type = "string",  default = "console" },
+  { key = "broadcastResults",  label = "Broadcast via network",         type = "boolean", default = true },
 })
 
--- Register component categories for auto-discovery
 REGISTRY.registerNetworkCategory("rail_signals", "RailroadSignal")
 REGISTRY.registerNetworkCategory("rail_switches", "RailroadSwitchControl")
 
@@ -52,17 +48,11 @@ local function discoverElements(force)
     end
   end
 
-  -- Fallback: scan all network components if REGISTRY gave nothing
   if #proxies["rail_signals"] == 0 and #proxies["rail_switches"] == 0 then
     local allIds = { component.findComponent("") }
     for _, id in ipairs(allIds) do
       local proxy = component.proxy(id)
       if proxy then
-        local classOk, className = pcall(function()
-          local t = tostring(proxy)
-          return t
-        end)
-        -- Try to detect signal/switch by available properties
         local isSignal = pcall(function() local _ = proxy.aspect end)
         local isSwitch = pcall(function() proxy.switchPosition(proxy) end)
         if isSignal then
@@ -84,97 +74,144 @@ end
 
 local broadcastEnabled = railConfig.broadcastResults ~= false
 
+-- Peer tracking for dynamic territory repartitioning
+local knownPeers = {}       -- peerIdentity → lastSeenMs
+local knownPeerCount = 0
+local PEER_TIMEOUT_MS = 45000
+
+local function checkPeerChanges()
+  local now = computer.millis()
+  local expired = {}
+  local currentCount = 0
+  for id, lastSeen in pairs(knownPeers) do
+    if now - lastSeen > PEER_TIMEOUT_MS then
+      table.insert(expired, id)
+    else
+      currentCount = currentCount + 1
+    end
+  end
+  for _, id in ipairs(expired) do
+    knownPeers[id] = nil
+  end
+  if currentCount ~= knownPeerCount then
+    knownPeerCount = currentCount
+    return true
+  end
+  return false
+end
+
 if NETWORK_BUS then
   NETWORK_BUS.registerChannel("rail_states")
   NETWORK_BUS.registerChannel("rail_commands")
 
-  -- Listen for commands from train_monitor or other controllers
   NETWORK_BUS.subscribe("rail_commands", function(senderCardId, senderIdentity, cmd)
     if not cmd or not cmd.action then return end
-
-    -- Optional targeting: only respond if targeted at us or broadcast
     if cmd.targetIdentity and cmd.targetIdentity ~= identity then return end
 
     local action = cmd.action
 
     if action == "toggle_switch" and cmd.switchId then
       scanner.toggleSwitch(cmd.switchId)
-
     elseif action == "set_switch" and cmd.switchId and cmd.position then
       scanner.setSwitchPosition(cmd.switchId, cmd.position)
-
     elseif action == "force_switch" and cmd.switchId and cmd.position then
       scanner.forceSwitchPosition(cmd.switchId, cmd.position)
-
     elseif action == "release_switch" and cmd.switchId then
       scanner.forceSwitchPosition(cmd.switchId, -1)
-
     elseif action == "set_forced_route" and cmd.route then
       scanner.applyForcedRoute(cmd)
-
     elseif action == "clear_forced_route" and cmd.trainId then
       scanner.releaseForcedRoute(cmd.trainId)
-
     elseif action == "rescan" then
       discoverElements(true)
-
-    elseif action == "ping" then
-      if NETWORK_BUS then
-        NETWORK_BUS.publish("rail_states", {
-          action = "pong",
-          identity = identity,
-        })
+    elseif action == "request_topology" then
+      local result = scanner.getResults()
+      if result and result.trackCount > 0 then
+        local payload = scanner.buildPayload(result)
+        payload.identity = identity
+        payload.action = "state_update"
+        NETWORK_BUS.publish("rail_states", payload)
       end
-
-    else
-      print("[RAIL] Unknown command: " .. tostring(action))
+    elseif action == "ping" then
+      NETWORK_BUS.publish("rail_states", {
+        action = "pong",
+        identity = identity,
+      })
     end
+  end)
+
+  NETWORK_BUS.subscribe("rail_states", function(senderCardId, senderIdentity, data)
+    if not data then return end
+    local key = data.identity or senderIdentity or senderCardId
+    if key == identity then return end
+
+    knownPeers[key] = computer.millis()
+
+    local peerSigs, peerSws = {}, {}
+    for _, sig in ipairs(data.signals or {}) do
+      if sig.id then peerSigs[sig.id] = true end
+    end
+    for _, sw in ipairs(data.switches or {}) do
+      if sw.id then peerSws[sw.id] = true end
+    end
+    scanner.updatePeerEquipment(peerSigs, peerSws)
   end)
 end
 
 -- ============================================================================
--- Periodic scan
+-- Task: single loop with topology/state phases
 -- ============================================================================
 
-local scanInterval = railConfig.scanInterval or 2
+local stateInterval = railConfig.stateInterval or 2
+local topologyIntervalMs = (railConfig.topologyInterval or 300) * 1000
+local nextTopologyAt = 0
 
-local function performScan()
-  discoverElements(false)
-
-  local scanResult = scanner.scan()
-  if not scanResult then return end
-
-  -- Console output (minimal)
-  if railConfig.outputMode ~= "console" then
-    -- Could add screen output here in the future
-  end
-
-  -- Broadcast state to the network
-  if broadcastEnabled and NETWORK_BUS then
-    local payload = scanner.buildPayload(scanResult)
-    payload.identity = identity
-    payload.action = "state_update"
-    NETWORK_BUS.publish("rail_states", payload)
-  end
-end
-
--- ============================================================================
--- Task registration
--- ============================================================================
-
-TASK_MANAGER.register("rail_scan", {
-  interval = scanInterval,
+TASK_MANAGER.register("rail_controller", {
+  interval = 120,
   factory = function()
     return async(function()
       while true do
-        TASK_MANAGER.heartbeat("rail_scan")
-        performScan()
-        sleep(scanInterval)
+        TASK_MANAGER.heartbeat("rail_controller")
+
+        local peerChanged = checkPeerChanges()
+        if peerChanged then
+          nextTopologyAt = 0
+        end
+
+        local now = computer.millis()
+        local isTopologyScan = (now >= nextTopologyAt)
+
+        local scanOk, scanErr = pcall(function()
+          if isTopologyScan then
+            discoverElements(true)
+            scanner.scanTopology()
+            nextTopologyAt = computer.millis() + topologyIntervalMs
+          else
+            scanner.scanStates()
+          end
+        end)
+        if not scanOk then
+          print("[RAIL] Scan error: " .. tostring(scanErr))
+        end
+
+        if broadcastEnabled and NETWORK_BUS and scanOk then
+          local result = scanner.getResults()
+          local payload = scanner.buildPayload(result)
+          payload.identity = identity
+          payload.action = "state_update"
+          if not isTopologyScan then
+            payload.tracks = nil
+          end
+          NETWORK_BUS.publish("rail_states", payload)
+        end
+
+        sleep(stateInterval)
       end
     end)
   end,
 })
 
-print("[RAIL] Controller active - scanning every " .. scanInterval .. "s"
+print("[RAIL] Controller active - states every " .. stateInterval .. "s, topology every "
+  .. math.floor(topologyIntervalMs / 1000) .. "s"
   .. (broadcastEnabled and " (broadcasting)" or "")
   .. " identity=" .. identity)

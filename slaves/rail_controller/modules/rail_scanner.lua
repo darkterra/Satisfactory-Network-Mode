@@ -3,6 +3,12 @@
 -- connected to this slave's FicsIt network.
 -- Reports their state (signal aspects, switch positions, track data) and
 -- publishes it to the network bus for the train_monitor to aggregate.
+--
+-- Architecture:
+--   scanTopology() — expensive BFS track walk + full element probe. Called at
+--                    boot, on peer changes, and every N minutes.
+--   scanStates()  — lightweight read of signal/switch dynamic state. Called
+--                    every 1-2 seconds for live map updates.
 
 local RailScanner = {}
 
@@ -31,9 +37,9 @@ local BLOCK_VALIDATION = {
 
 local discoveredSignals = {}
 local discoveredSwitches = {}
+local nbPrecedentDiscoveredSignals = 0
+local nbPrecedentDiscoveredSwitches = 0
 
---- Discover all signals and switches accessible from the component network.
--- @param proxiesByCategory table - from REGISTRY, keyed by category name
 function RailScanner.discover(proxiesByCategory)
   discoveredSignals = {}
   discoveredSwitches = {}
@@ -56,14 +62,26 @@ function RailScanner.discover(proxiesByCategory)
     })
   end
 
-  print("[RAIL_SCAN] Discovered " .. #discoveredSignals .. " signals, ".. #discoveredSwitches .. " switches")
+  if #discoveredSignals ~= nbPrecedentDiscoveredSignals or #discoveredSwitches ~= nbPrecedentDiscoveredSwitches then
+    print("[RAIL_SCAN] Discovery found " .. #discoveredSignals .. " signals, ".. #discoveredSwitches .. " switches")
+    
+    nbPrecedentDiscoveredSignals = #discoveredSignals
+    nbPrecedentDiscoveredSwitches = #discoveredSwitches
+  end
 end
 
 -- ============================================================================
--- Scanning
+-- Topology cache — populated by scanTopology(), read by scanStates()
 -- ============================================================================
 
---- Collect state of a single signal.
+local cachedSignalTopo = {}   -- sigId → full data from scanSignal
+local cachedSwitchTopo = {}   -- swId → full data from scanSwitch
+local cachedTracks = {}       -- array of track segments from BFS
+
+-- ============================================================================
+-- Signal scanning (full topology + state)
+-- ============================================================================
+
 local function scanSignal(sigInfo)
   local proxy = sigInfo.proxy
   local data = {
@@ -113,7 +131,39 @@ local function scanSignal(sigInfo)
   return data
 end
 
---- Euclidean distance between two {x,y,z} locations.
+-- ============================================================================
+-- Signal state-only update (lightweight, no topology re-probe)
+-- ============================================================================
+
+local function updateSignalState(sigInfo)
+  local data = cachedSignalTopo[sigInfo.id]
+  if not data then return end
+
+  local ok, aspect = pcall(function() return sigInfo.proxy.aspect end)
+  if ok then
+    data.aspect = aspect
+    data.aspectLabel = SIGNAL_ASPECTS[aspect] or "Unknown"
+  end
+
+  local ok2, bv = pcall(function() return sigInfo.proxy.blockValidation end)
+  if ok2 then
+    data.blockValidation = bv
+    data.blockValidationLabel = BLOCK_VALIDATION[bv] or "Unknown"
+  end
+
+  if data.hasObservedBlock then
+    local blockOk, block = pcall(sigInfo.proxy.getObservedBlock, sigInfo.proxy)
+    if blockOk and block then
+      local isOccOk, isOccupied = pcall(function() return block.isOccupied end)
+      data.blockOccupied = isOccOk and isOccupied or false
+    end
+  end
+end
+
+-- ============================================================================
+-- Switch scanning
+-- ============================================================================
+
 local function vecDistance(a, b)
   local dx = (a.x or 0) - (b.x or 0)
   local dy = (a.y or 0) - (b.y or 0)
@@ -121,14 +171,8 @@ local function vecDistance(a, b)
   return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
 
-
---- Switches locked by our code via setSwitchPosition (enforced every scan).
---- FIN's native forceSwitchPosition crashes (assertion in AFIRSubsystem::UpdateRailroadSwitch),
---- so we emulate it with periodic re-application of setSwitchPosition.
 local lockedSwitches = {} -- switchId → position (or nil)
 
-
---- Collect state of a single switch.
 local function scanSwitch(swInfo)
   local proxy = swInfo.proxy
   local data = {
@@ -141,12 +185,21 @@ local function scanSwitch(swInfo)
     lockedPos = lockedSwitches[swInfo.id],
   }
 
-  local posOk, pos = pcall(proxy.switchPosition, proxy)
+  local posOk, pos = pcall(function() return proxy.switchPosition end)
   if posOk then data.position = pos end
 
   local connOk, conns = pcall(proxy.getControlledConnections, proxy)
   if connOk and conns then
     data.numPositions = #conns
+    if #conns > 0 then
+      local stemOk, stems = pcall(conns[1].getConnections, conns[1])
+      if stemOk and stems and #stems > 0 then
+        local brOk, branches = pcall(stems[1].getConnections, stems[1])
+        if brOk and branches and #branches > data.numPositions then
+          data.numPositions = #branches
+        end
+      end
+    end
 
     if #conns > 0 then
       local locOk, loc = pcall(function() return conns[1].connectorLocation end)
@@ -209,17 +262,24 @@ local function scanSwitch(swInfo)
 end
 
 -- ============================================================================
--- Track collection: Territory BFS
--- Each rail_controller walks outward from its own signals/switches and fills
--- its "territory", stopping when it reaches equipment owned by a different
--- controller. This dynamically partitions the network: controllers placed
--- close together share a tight boundary, while sparse controllers cover the
--- long stretches between them. Map-side dedup (drawnTrackIds) handles the
--- small overlap at boundaries.
+-- Switch state-only update (lightweight, no topology re-probe)
 -- ============================================================================
 
---- Compute Hermite interpolation waypoints between two connection endpoints.
---- Uses connectorLocation + connectorNormal to approximate the track curve.
+local function updateSwitchState(swInfo)
+  local data = cachedSwitchTopo[swInfo.id]
+  if not data then return end
+
+  local posOk, pos = pcall(function() return swInfo.proxy.switchPosition end)
+  if posOk then data.position = pos end
+  data.isLocked = lockedSwitches[swInfo.id] ~= nil
+  data.lockedPos = lockedSwitches[swInfo.id]
+end
+
+-- ============================================================================
+-- Track collection: Territory BFS
+-- Functions are defined at module level (no closures per call).
+-- ============================================================================
+
 local function hermiteWaypoints(startLoc, startNorm, endLoc, endNorm, trackLen, numPts)
   if not startLoc or not endLoc then return nil end
   numPts = numPts or 4
@@ -249,7 +309,6 @@ local function hermiteWaypoints(startLoc, startNorm, endLoc, endNorm, trackLen, 
   return waypoints
 end
 
---- Collect a single track segment from a connection pair (conn + its opposite).
 local function collectTrackFromConn(conn, visitedTrackIds)
   local trackOk, track = pcall(conn.getTrack, conn)
   if not trackOk or not track then return nil end
@@ -282,134 +341,166 @@ local function collectTrackFromConn(conn, visitedTrackIds)
   }
 end
 
---- Check whether a RailroadTrackConnection has a signal or switch that this
---- controller does NOT own. Used as boundary detection for territory BFS:
---- foreign equipment marks the edge of another controller's territory.
+-- Equipment IDs confirmed as belonging to a specific peer controller
+local confirmedPeerSignalIds = {}
+local confirmedPeerSwitchIds = {}
+
+function RailScanner.updatePeerEquipment(peerSignalIds, peerSwitchIds)
+  confirmedPeerSignalIds = peerSignalIds or {}
+  confirmedPeerSwitchIds = peerSwitchIds or {}
+end
+
 local function connectionHasForeignEquipment(conn, ownSignalIds, ownSwitchIds)
+  if next(confirmedPeerSignalIds) == nil and next(confirmedPeerSwitchIds) == nil then
+    return false
+  end
   local fOk, fSig = pcall(conn.getFacingSignal, conn)
-  if fOk and fSig and not ownSignalIds[tostring(fSig)] then return true end
+  if fOk and fSig then
+    local sid = tostring(fSig)
+    if not ownSignalIds[sid] and confirmedPeerSignalIds[sid] then return true end
+  end
   local tOk, tSig = pcall(conn.getTrailingSignal, conn)
-  if tOk and tSig and not ownSignalIds[tostring(tSig)] then return true end
+  if tOk and tSig then
+    local sid = tostring(tSig)
+    if not ownSignalIds[sid] and confirmedPeerSignalIds[sid] then return true end
+  end
   local swOk, swCtrl = pcall(conn.getSwitchControl, conn)
-  if swOk and swCtrl and not ownSwitchIds[tostring(swCtrl)] then return true end
+  if swOk and swCtrl then
+    local sid = tostring(swCtrl)
+    if not ownSwitchIds[sid] and confirmedPeerSwitchIds[sid] then return true end
+  end
   return false
 end
 
---- BFS from own equipment, collecting every track until a foreign boundary.
---- Each controller "fills" the rails between its own signals/switches and the
---- nearest equipment belonging to another controller. Dead-ends and long
---- stretches with no intermediate equipment are naturally covered.
+--- BFS helper: enqueue a connection if its track hasn't been enqueued yet.
+local function bfsEnqueue(ctx, conn)
+  local tOk, t = pcall(conn.getTrack, conn)
+  if tOk and t then
+    local tid = tostring(t)
+    if not ctx.enqueuedTrackIds[tid] then
+      ctx.enqueuedTrackIds[tid] = true
+      table.insert(ctx.queue, conn)
+    end
+  end
+end
+
+--- BFS helper: explore neighbours from a connection endpoint.
+local function bfsExploreFrom(ctx, c)
+  if not c then return end
+  if connectionHasForeignEquipment(c, ctx.ownSignalIds, ctx.ownSwitchIds) then return end
+  local nextOk, nxt = pcall(c.getNext, c)
+  if nextOk and nxt then bfsEnqueue(ctx, nxt) end
+  local connsOk, nextConns = pcall(c.getConnections, c)
+  if connsOk and nextConns then
+    for _, alt in ipairs(nextConns) do bfsEnqueue(ctx, alt) end
+  end
+end
+
 local function collectTerritoryTracks()
+  local ctx = {
+    queue = {},
+    enqueuedTrackIds = {},
+    ownSignalIds = {},
+    ownSwitchIds = {},
+  }
   local segments = {}
   local visitedTrackIds = {}
-  local queue = {}
 
-  local ownSignalIds = {}
-  for _, sig in ipairs(discoveredSignals) do ownSignalIds[sig.id] = true end
-  local ownSwitchIds = {}
-  for _, sw in ipairs(discoveredSwitches) do ownSwitchIds[sw.id] = true end
+  for _, sig in ipairs(discoveredSignals) do ctx.ownSignalIds[sig.id] = true end
+  for _, sw in ipairs(discoveredSwitches) do ctx.ownSwitchIds[sw.id] = true end
 
-  -- Seed from own signals (both directions per guarded connection)
   for _, sig in ipairs(discoveredSignals) do
     local ok, conns = pcall(sig.proxy.getGuardedConnnections, sig.proxy)
     if ok and conns then
-      for _, conn in ipairs(conns) do
-        table.insert(queue, conn)
-        local oppOk, opp = pcall(conn.getOpposite, conn)
-        if oppOk and opp then table.insert(queue, opp) end
-      end
+      for _, conn in ipairs(conns) do bfsEnqueue(ctx, conn) end
     end
   end
 
-  -- Seed from own switches (both directions per controlled connection)
   for _, sw in ipairs(discoveredSwitches) do
     local ok, conns = pcall(sw.proxy.getControlledConnections, sw.proxy)
     if ok and conns then
-      for _, conn in ipairs(conns) do
-        table.insert(queue, conn)
-        local oppOk, opp = pcall(conn.getOpposite, conn)
-        if oppOk and opp then table.insert(queue, opp) end
-      end
+      for _, conn in ipairs(conns) do bfsEnqueue(ctx, conn) end
     end
   end
 
-  local MAX_ITERATIONS = 4000
+  local MAX_ITERATIONS = 8000
   local iter = 0
 
-  while #queue > 0 and iter < MAX_ITERATIONS do
+  while #ctx.queue > 0 and iter < MAX_ITERATIONS do
     iter = iter + 1
-    local conn = table.remove(queue, 1)
+    local conn = table.remove(ctx.queue, 1)
 
     local seg = collectTrackFromConn(conn, visitedTrackIds)
     if seg then
       table.insert(segments, seg)
-    end
 
-    -- Walk from the far end of this track toward the next segment
-    local oppOk, opp = pcall(conn.getOpposite, conn)
-    if oppOk and opp then
-      if not connectionHasForeignEquipment(opp, ownSignalIds, ownSwitchIds) then
-        local function enqueueIfNew(c)
-          local ok, t = pcall(c.getTrack, c)
-          if ok and t and not visitedTrackIds[tostring(t)] then
-            table.insert(queue, c)
-          end
-        end
-
-        -- Primary: getNext follows active path (reliable on all connections)
-        local nextOk, nxt = pcall(opp.getNext, opp)
-        if nextOk and nxt then enqueueIfNew(nxt) end
-
-        -- Supplement: getConnections reveals alternative switch branches
-        local connsOk, nextConns = pcall(opp.getConnections, opp)
-        if connsOk and nextConns then
-          for _, alt in ipairs(nextConns) do enqueueIfNew(alt) end
-        end
+      bfsExploreFrom(ctx, conn)
+      local oppOk, opp = pcall(conn.getOpposite, conn)
+      if oppOk and opp then
+        bfsExploreFrom(ctx, opp)
       end
     end
-  end
-
-  if iter >= MAX_ITERATIONS then
-    print("[RAIL_SCAN] Territory BFS hit iteration limit (" .. MAX_ITERATIONS .. ")")
   end
 
   return segments
 end
 
---- Perform a full scan of all discovered rail elements.
-function RailScanner.scan()
-  local signals = {}
+-- ============================================================================
+-- Public scan API
+-- ============================================================================
+
+--- Full topology scan: probe every element + BFS for tracks.
+--- Call at boot, on peer changes, and periodically (every few minutes).
+function RailScanner.scanTopology()
+  cachedSignalTopo = {}
   for _, sigInfo in ipairs(discoveredSignals) do
     local ok, data = pcall(scanSignal, sigInfo)
-    if ok then
-      table.insert(signals, data)
-    else
-      print("[RAIL_SCAN] Error scanning signal: " .. tostring(data))
-    end
+    if ok then cachedSignalTopo[sigInfo.id] = data end
   end
 
-  local switches = {}
+  cachedSwitchTopo = {}
   for _, swInfo in ipairs(discoveredSwitches) do
     local ok, data = pcall(scanSwitch, swInfo)
-    if ok then
-      table.insert(switches, data)
-    else
-      print("[RAIL_SCAN] Error scanning switch: " .. tostring(data))
-    end
+    if ok then cachedSwitchTopo[swInfo.id] = data end
   end
 
-  local tracks = collectTerritoryTracks()
+  cachedTracks = collectTerritoryTracks()
 
   RailScanner.enforceLockedSwitches()
+end
 
+--- Lightweight state scan: only read dynamic properties (aspect, position).
+--- Call every 1-2 seconds for live updates.
+function RailScanner.scanStates()
+  for _, sigInfo in ipairs(discoveredSignals) do
+    updateSignalState(sigInfo)
+  end
+  for _, swInfo in ipairs(discoveredSwitches) do
+    updateSwitchState(swInfo)
+  end
+  RailScanner.enforceLockedSwitches()
+end
+
+--- Build a result table from cached data (same format as the old scan()).
+function RailScanner.getResults()
+  local signals = {}
+  for _, sigInfo in ipairs(discoveredSignals) do
+    local data = cachedSignalTopo[sigInfo.id]
+    if data then table.insert(signals, data) end
+  end
+  local switches = {}
+  for _, swInfo in ipairs(discoveredSwitches) do
+    local data = cachedSwitchTopo[swInfo.id]
+    if data then table.insert(switches, data) end
+  end
   return {
     signals = signals,
     switches = switches,
-    tracks = tracks,
+    tracks = cachedTracks,
     timestamp = computer.millis(),
     signalCount = #signals,
     switchCount = #switches,
-    trackCount = #tracks,
+    trackCount = #cachedTracks,
   }
 end
 
@@ -420,27 +511,23 @@ end
 function RailScanner.toggleSwitch(switchId)
   for _, swInfo in ipairs(discoveredSwitches) do
     if swInfo.id == switchId then
+      local posOk, currentPos = pcall(function() return swInfo.proxy.switchPosition end)
+      if not posOk or type(currentPos) ~= "number" then currentPos = 0 end
+
       local connOk, conns = pcall(swInfo.proxy.getControlledConnections, swInfo.proxy)
       if connOk and conns and #conns > 0 then
         local mainConn = conns[1]
-        local posOk, currentPos = pcall(mainConn.getSwitchPosition, mainConn)
-        local numPos = #conns
-        if posOk and numPos > 0 then
-          local nextPos = (currentPos + 1) % numPos
-          local setOk, err = pcall(mainConn.setSwitchPosition, mainConn, nextPos)
-          if setOk then
-            print("[RAIL_SCAN] Toggled switch " .. switchId .. " → pos " .. nextPos)
-            return true
-          else
-            print("[RAIL_SCAN] Failed to toggle: " .. tostring(err))
-            return false
-          end
+        local nextPos = currentPos + 1
+        local setOk, err = pcall(mainConn.setSwitchPosition, mainConn, nextPos)
+        if not setOk then
+          nextPos = 0
+          setOk, err = pcall(mainConn.setSwitchPosition, mainConn, 0)
         end
+        if setOk then return true end
       end
       return false
     end
   end
-  print("[RAIL_SCAN] Switch not found: " .. switchId)
   return false
 end
 
@@ -451,13 +538,7 @@ function RailScanner.setSwitchPosition(switchId, position)
       if connOk and conns and #conns > 0 then
         local mainConn = conns[1]
         local setOk, err = pcall(mainConn.setSwitchPosition, mainConn, position)
-        if setOk then
-          print("[RAIL_SCAN] Set switch " .. switchId .. " to position " .. position)
-          return true
-        else
-          print("[RAIL_SCAN] Failed to set position: " .. tostring(err))
-          return false
-        end
+        return setOk == true
       end
       return false
     end
@@ -465,23 +546,17 @@ function RailScanner.setSwitchPosition(switchId, position)
   return false
 end
 
---- Lock or release a switch position.
---- position >= 0 → lock at that position (re-applied every scan cycle).
---- position < 0  → release the lock.
 function RailScanner.forceSwitchPosition(switchId, position)
   if position >= 0 then
     lockedSwitches[switchId] = math.floor(position)
     RailScanner.setSwitchPosition(switchId, math.floor(position))
-    print("[RAIL_SCAN] Locked switch " .. switchId .. " at position " .. math.floor(position))
     return true
   else
     lockedSwitches[switchId] = nil
-    print("[RAIL_SCAN] Released switch lock " .. switchId)
     return true
   end
 end
 
---- Re-apply all locked switch positions. Called from scan() every cycle.
 function RailScanner.enforceLockedSwitches()
   for switchId, pos in pairs(lockedSwitches) do
     RailScanner.setSwitchPosition(switchId, pos)
@@ -520,7 +595,7 @@ function RailScanner.releaseForcedRoute(trainId)
 end
 
 -- ============================================================================
--- Network payload builders
+-- Network payload builder
 -- ============================================================================
 
 function RailScanner.buildPayload(scanResult)
